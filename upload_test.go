@@ -193,17 +193,23 @@ func TestCreateUploadOutcomeContract(t *testing.T) {
 			ExpiresAt: deadline.Add(-23*time.Hour - 45*time.Minute),
 		},
 	}
+	expired := base
+	expired.State = "expired"
+	expired.UploadRequest = nil
+	expired.Failure = &uploadFailure{Code: "upload_expired"}
 	tests := []struct {
-		name       string
-		result     createUploadResult
-		err        error
-		wantStatus int
-		wantCode   string
+		name           string
+		result         createUploadResult
+		err            error
+		wantStatus     int
+		wantCode       string
+		wantCapability bool
 	}{
-		{"exact replay", createUploadResult{Upload: base, Created: false}, nil, http.StatusOK, ""},
-		{"reused key", createUploadResult{}, errIdempotencyKeyReused, http.StatusUnprocessableEntity, "idempotency_key_reused"},
-		{"dependency unavailable", createUploadResult{}, errServiceUnavailable, http.StatusServiceUnavailable, "service_unavailable"},
-		{"deterministic internal failure", createUploadResult{}, errors.New("raw-database-secret"), http.StatusInternalServerError, "internal_error"},
+		{"exact replay", createUploadResult{Upload: base, Created: false}, nil, http.StatusOK, "", true},
+		{"expired replay", createUploadResult{Upload: expired, Created: false}, nil, http.StatusOK, "", false},
+		{"reused key", createUploadResult{}, errIdempotencyKeyReused, http.StatusUnprocessableEntity, "idempotency_key_reused", false},
+		{"dependency unavailable", createUploadResult{}, errServiceUnavailable, http.StatusServiceUnavailable, "service_unavailable", false},
+		{"deterministic internal failure", createUploadResult{}, errors.New("raw-database-secret"), http.StatusInternalServerError, "internal_error", false},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -222,7 +228,11 @@ func TestCreateUploadOutcomeContract(t *testing.T) {
 				t.Fatalf("status=%d headers=%v body=%s", recorder.Code, recorder.Header(), recorder.Body.String())
 			}
 			if test.wantCode == "" {
-				if recorder.Header().Get("Location") != "" || !strings.Contains(recorder.Body.String(), `"upload_id":"`+testUploadID+`"`) || !strings.Contains(recorder.Body.String(), `"upload_request"`) {
+				hasCapability := strings.Contains(recorder.Body.String(), `"upload_request"`)
+				if recorder.Header().Get("Location") != "" ||
+					!strings.Contains(recorder.Body.String(), `"upload_id":"`+testUploadID+`"`) ||
+					hasCapability != test.wantCapability ||
+					(!test.wantCapability && !strings.Contains(recorder.Body.String(), `"code":"upload_expired"`)) {
 					t.Fatalf("replay response is not the exact 200 representation: headers=%v body=%s", recorder.Header(), recorder.Body.String())
 				}
 				return
@@ -352,6 +362,40 @@ func TestExactDispatcherAndRepresentation(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("expired GET representation", func(t *testing.T) {
+		app := &application{
+			logger: slog.New(slog.NewJSONHandler(io.Discard, nil)),
+			getUpload: func(context.Context, string) (uploadRepresentation, error) {
+				return uploadRepresentation{
+					UploadID:            testUploadID,
+					State:               "expired",
+					DeclaredSizeBytes:   11,
+					DeclaredContentType: "image/jpeg",
+					UploadDeadline:      deadline,
+					Failure:             &uploadFailure{Code: "upload_expired"},
+				}, nil
+			},
+		}
+		recorder := httptest.NewRecorder()
+		app.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/uploads/"+testUploadID, nil))
+		var got map[string]any
+		if recorder.Code != http.StatusOK || recorder.Header().Get("Cache-Control") != "no-store" ||
+			json.Unmarshal(recorder.Body.Bytes(), &got) != nil {
+			t.Fatalf("expired GET status=%d headers=%v body=%s", recorder.Code, recorder.Header(), recorder.Body.String())
+		}
+		want := map[string]any{
+			"upload_id":             testUploadID,
+			"state":                 "expired",
+			"declared_size_bytes":   float64(11),
+			"declared_content_type": "image/jpeg",
+			"upload_deadline":       deadline.Format(time.RFC3339),
+			"failure":               map[string]any{"code": "upload_expired"},
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("expired GET representation=%#v, want %#v", got, want)
+		}
+	})
 
 	app := &application{
 		logger: slog.New(slog.NewJSONHandler(io.Discard, nil)),
@@ -487,6 +531,48 @@ func TestExactDispatcherAndRepresentation(t *testing.T) {
 			t.Fatalf("completion logs disclosed %q", forbidden)
 		}
 	}
+
+	t.Run("late completion transition emitted once", func(t *testing.T) {
+		var logs bytes.Buffer
+		var calls atomic.Int64
+		counter := serviceMetrics.Get("upload_transitions_total").(*expvar.Map).Get("pending_to_expired").(*expvar.Int)
+		before := counter.Value()
+		app := &application{
+			logger: slog.New(slog.NewJSONHandler(&logs, nil)),
+			completeUpload: func(context.Context, string) (completeUploadResult, error) {
+				transition := ""
+				if calls.Add(1) == 1 {
+					transition = "pending_to_expired"
+				}
+				return completeUploadResult{Upload: uploadRepresentation{
+					UploadID:            testUploadID,
+					State:               "expired",
+					DeclaredSizeBytes:   11,
+					DeclaredContentType: "image/jpeg",
+					UploadDeadline:      deadline,
+					Failure:             &uploadFailure{Code: "upload_expired"},
+				}, Transition: transition}, nil
+			},
+		}
+		for range 2 {
+			recorder := httptest.NewRecorder()
+			app.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/uploads/"+testUploadID+"/complete", nil))
+			if recorder.Code != http.StatusOK || recorder.Header().Get("Location") != "" ||
+				recorder.Header().Get("Cache-Control") != "no-store" ||
+				!strings.Contains(recorder.Body.String(), `"code":"upload_expired"`) {
+				t.Fatalf("late completion status=%d headers=%v body=%s", recorder.Code, recorder.Header(), recorder.Body.String())
+			}
+		}
+		if counter.Value()-before != 1 || strings.Count(logs.String(), `"msg":"upload.transition"`) != 1 ||
+			!strings.Contains(logs.String(), `"reason_code":"upload_deadline_elapsed"`) {
+			t.Fatalf("late transition counter delta=%d logs=%s", counter.Value()-before, logs.String())
+		}
+		for _, forbidden := range []string{"X-Amz-", "staging/", testIdempotencyKey, "raw-database-secret"} {
+			if strings.Contains(logs.String(), forbidden) {
+				t.Fatalf("late completion logs disclosed %q", forbidden)
+			}
+		}
+	})
 
 	t.Run("content outcomes", testGetContentOutcomes)
 	t.Run("content route and empty request", testGetContentExactRouteAndEmptyRequest)
@@ -687,6 +773,54 @@ func TestIntegrationCreateIdempotencyAndRecovery(t *testing.T) {
 		}
 		if visibleRows != 0 {
 			t.Fatalf("bounded wait left %d rows", visibleRows)
+		}
+	})
+
+	t.Run("deadline replay does not return or persist a capability", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		pool := newSingleConnectionPool(t, ctx, cfg.DatabaseURL)
+		defer pool.Close()
+
+		uploadID, idempotencyKey := testUUID(t), testUUID(t)
+		seed, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal("begin deadline replay seed")
+		}
+		defer seed.Rollback(context.Background())
+		insertLatePendingUpload(t, ctx, seed, uploadID, idempotencyKey)
+		if err := seed.Commit(ctx); err != nil {
+			t.Fatal("commit deadline replay seed")
+		}
+		defer cleanupUploadByIdempotencyKey(t, pool, idempotencyKey)
+
+		var horizonBefore time.Time
+		if err := pool.QueryRow(ctx, `
+			SELECT max_write_expires_at
+			FROM uploads
+			WHERE upload_id = $1::uuid`, uploadID).Scan(&horizonBefore); err != nil {
+			t.Fatal("read deadline replay horizon")
+		}
+		var presignCalls atomic.Int64
+		replayed, err := createOrReplayUpload(
+			ctx,
+			pool,
+			testUploadPresigner(&presignCalls, nil),
+			createUploadCommand{IdempotencyKey: idempotencyKey, SizeBytes: 47, ContentType: "image/png"},
+		)
+		if err != nil || replayed.Created || replayed.Upload.UploadID != uploadID ||
+			replayed.Upload.State != "pending" || replayed.Upload.UploadRequest != nil {
+			t.Fatalf("deadline replay=%#v error=%v", replayed, err)
+		}
+		var horizonAfter time.Time
+		if err := pool.QueryRow(ctx, `
+			SELECT max_write_expires_at
+			FROM uploads
+			WHERE upload_id = $1::uuid`, uploadID).Scan(&horizonAfter); err != nil {
+			t.Fatal("read deadline replay outcome")
+		}
+		if presignCalls.Load() != 1 || !horizonAfter.Equal(horizonBefore) {
+			t.Fatalf("deadline replay presigns=%d horizon_changed=%t", presignCalls.Load(), !horizonAfter.Equal(horizonBefore))
 		}
 	})
 

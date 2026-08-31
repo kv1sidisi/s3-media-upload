@@ -76,7 +76,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		return errors.New("http listener creation failed")
 	}
 	workerContext, stopWorkers := context.WithCancel(ctx)
-	workerDone := make(chan struct{})
+	workerDone := make(chan struct{}, 2)
 	go func() {
 		runFinalizer(
 			workerContext,
@@ -86,10 +86,15 @@ func run(ctx context.Context, logger *slog.Logger) error {
 			cfg.S3Bucket,
 			cfg.FinalizeClaimLease,
 		)
-		close(workerDone)
+		workerDone <- struct{}{}
+	}()
+	go func() {
+		runExpiry(workerContext, logger, pool)
+		workerDone <- struct{}{}
 	}()
 	defer func() {
 		stopWorkers()
+		<-workerDone
 		<-workerDone
 	}()
 	serveResult := make(chan error, 1)

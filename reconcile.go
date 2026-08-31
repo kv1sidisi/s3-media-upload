@@ -158,6 +158,13 @@ func (f *finalizer) processNext(ctx context.Context) (bool, error) {
 	if !active {
 		return true, nil
 	}
+	observedHorizon, expiryEligible, active, err := prepareMissingObservation(ctx, f.pool, claim)
+	if err != nil {
+		return true, f.retry(ctx, claim, "staging_observe", classifyDatabaseError(err, false))
+	}
+	if !active {
+		return true, nil
+	}
 	finishObserve := f.phase(claim, "staging_observe")
 	finishCapture := f.phase(claim, "staging_capture")
 	staging, readErr := captureS3Object(
@@ -171,6 +178,9 @@ func (f *finalizer) processNext(ctx context.Context) (bool, error) {
 		finishCapture("retry")
 		if storageObjectMissing(readErr) {
 			finishObserve("missing")
+			if expiryEligible {
+				return true, f.expireMissing(ctx, claim, observedHorizon, candidates)
+			}
 			return true, f.retry(ctx, claim, "staging_observe", "transient")
 		}
 		finishObserve("retry")
@@ -971,6 +981,7 @@ func transitionFinalizeRejected(
 
 type lockedFinalizeUpload struct {
 	DatabaseNow       time.Time
+	UploadDeadline    time.Time
 	MaxWriteExpiresAt time.Time
 	StagingKey        string
 	FailureStreak     int
@@ -986,6 +997,7 @@ func lockFinalizeParent(
 	err := tx.QueryRow(ctx, `
 		SELECT
 			staging_key,
+			upload_deadline,
 			max_write_expires_at,
 			reconcile_failure_streak,
 			claim_expires_at
@@ -998,6 +1010,7 @@ func lockFinalizeParent(
 		claim.Token,
 	).Scan(
 		&parent.StagingKey,
+		&parent.UploadDeadline,
 		&parent.MaxWriteExpiresAt,
 		&parent.FailureStreak,
 		&claimExpiresAt,
@@ -1015,6 +1028,7 @@ func lockFinalizeParent(
 		return lockedFinalizeUpload{}, false, nil
 	}
 	parent.DatabaseNow = parent.DatabaseNow.UTC()
+	parent.UploadDeadline = parent.UploadDeadline.UTC()
 	parent.MaxWriteExpiresAt = parent.MaxWriteExpiresAt.UTC()
 	return parent, true, nil
 }

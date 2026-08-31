@@ -411,35 +411,10 @@ func completeUploadAttempt(
 			result.Upload.State = "finalizing"
 			result.Transition = "pending_to_finalizing"
 		} else {
-			commandTag, updateErr := tx.Exec(databaseContext, `
-				UPDATE uploads
-				SET state = 'expired',
-				    terminal_at = $2::timestamptz,
-				    expiry_reason = 'upload_deadline_elapsed'
-				WHERE upload_id = $1::uuid
-				  AND state = 'pending'
-				  AND upload_deadline <= $2::timestamptz`,
-				locked.Upload.UploadID,
-				locked.DatabaseNow,
-			)
+			applied, updateErr := transitionPendingExpiredLocked(databaseContext, tx, locked)
 			err = updateErr
-			rowsAffected = commandTag.RowsAffected()
-			if err == nil && rowsAffected == 1 {
-				_, err = tx.Exec(databaseContext, `
-					INSERT INTO cleanup_tombstones (
-						object_key,
-						upload_id,
-						candidate_sha256,
-						created_at,
-						delete_not_before,
-						next_attempt_at
-					)
-					VALUES ($1::text, $2::uuid, NULL, $3::timestamptz, $4::timestamptz, $4::timestamptz)`,
-					locked.StagingKey,
-					locked.Upload.UploadID,
-					locked.DatabaseNow,
-					locked.MaxWriteExpiresAt,
-				)
+			if applied {
+				rowsAffected = 1
 			}
 			result.Upload.State = "expired"
 			result.Upload.Failure = &uploadFailure{Code: "upload_expired"}

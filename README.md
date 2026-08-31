@@ -17,6 +17,7 @@ structured logs, and process counters.
 - `POST /uploads/{upload_id}/complete` with restart-safe `finalizing` intent;
 - a sequential fenced finalizer with bounded validation, candidate publication, and
   full-GET verification;
+- time-driven abandoned and confirmed-missing expiry with durable cleanup duties;
 - immutable `ready`/`rejected` outcomes and `GET /uploads/{upload_id}/content`;
 - `GET /uploads/{upload_id}` with an authoritative PostgreSQL representation;
 - `GET /livez`, `GET /readyz`, and `GET /debug/vars`;
@@ -26,7 +27,7 @@ structured logs, and process counters.
 
 ### Planned
 
-- time-driven missing expiry and physical object cleanup.
+- physical object cleanup.
 
 ### Observed
 
@@ -113,6 +114,9 @@ writing, and performs a full length-and-SHA-256 GET verification before committi
 after the upload deadline atomically expires the upload and records staging cleanup
 work. Claims are fenced leases, not exactly-once execution: after a crash or ambiguous
 PUT, a fresh worker verifies every tracked candidate before reading staging again.
+Pending uploads expire after their half-open 24-hour deadline. A finalizing upload
+expires only after every tracked candidate was reconciled and a fresh authenticated
+staging read confirms absence after both the upload and authorized-write horizons.
 
 `GET /uploads/{upload_id}` reads the current state from PostgreSQL and never returns a
 storage URL, bucket, object key, ETag, digest, completion timestamp, claim, or retry
@@ -173,5 +177,5 @@ This service has no authentication, TLS, rate limiting, quota enforcement, or pu
 upload controls. Do not expose it to a LAN or the Internet. The bucket must remain
 private, and credentials, DSNs, presigned URLs, request data, and object identifiers
 must not enter logs. This repository does not claim deployment, live AWS verification,
-broad S3 compatibility, or production readiness. Time-driven missing expiry and
-physical tombstone deletion remain separate planned slices.
+broad S3 compatibility, or production readiness. Physical tombstone deletion remains
+a separate planned slice.

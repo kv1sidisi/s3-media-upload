@@ -102,39 +102,89 @@ func TestWorkerSchedulingAndCancellation(t *testing.T) {
 	if finalizerIdleWait != time.Second {
 		t.Fatalf("finalizer idle wait=%s, want 1s", finalizerIdleWait)
 	}
-	synctest.Test(t, func(t *testing.T) {
-		ctx, cancel := context.WithCancel(t.Context())
-		calls := make(chan time.Time, 3)
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			runFinalizerLoop(ctx, func(context.Context) (bool, error) {
-				calls <- time.Now()
-				return false, nil
-			})
-		}()
+	if expirySweepInterval != time.Minute {
+		t.Fatalf("expiry sweep interval=%s, want 1m", expirySweepInterval)
+	}
+	t.Run("finalizer idle", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			calls := make(chan time.Time, 3)
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				runFinalizerLoop(ctx, func(context.Context) (bool, error) {
+					calls <- time.Now()
+					return false, nil
+				})
+			}()
 
-		synctest.Wait()
-		first := <-calls
-		time.Sleep(finalizerIdleWait - time.Nanosecond)
-		synctest.Wait()
-		if len(calls) != 0 {
-			t.Fatal("finalizer retried before the one-second idle wait")
-		}
-		time.Sleep(time.Nanosecond)
-		synctest.Wait()
-		second := <-calls
-		if second.Sub(first) != finalizerIdleWait {
-			t.Fatalf("finalizer retry interval=%s, want %s", second.Sub(first), finalizerIdleWait)
-		}
+			synctest.Wait()
+			first := <-calls
+			time.Sleep(finalizerIdleWait - time.Nanosecond)
+			synctest.Wait()
+			if len(calls) != 0 {
+				t.Fatal("finalizer retried before the one-second idle wait")
+			}
+			time.Sleep(time.Nanosecond)
+			synctest.Wait()
+			second := <-calls
+			if second.Sub(first) != finalizerIdleWait {
+				t.Fatalf("finalizer retry interval=%s, want %s", second.Sub(first), finalizerIdleWait)
+			}
 
-		cancel()
-		synctest.Wait()
-		select {
-		case <-done:
-		default:
-			t.Fatal("canceled finalizer did not stop")
-		}
+			cancel()
+			synctest.Wait()
+			select {
+			case <-done:
+			default:
+				t.Fatal("canceled finalizer did not stop")
+			}
+		})
+	})
+	t.Run("expiry immediate and non-overlapping", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			calls := make(chan time.Time, 3)
+			release := make(chan struct{})
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				runExpiryLoop(ctx, func(context.Context) {
+					calls <- time.Now()
+					<-release
+				})
+			}()
+
+			synctest.Wait()
+			first := <-calls
+			time.Sleep(2 * expirySweepInterval)
+			synctest.Wait()
+			if len(calls) != 0 {
+				t.Fatal("expiry sweep overlapped a blocked pass")
+			}
+			release <- struct{}{}
+			synctest.Wait()
+			time.Sleep(expirySweepInterval - time.Nanosecond)
+			synctest.Wait()
+			if len(calls) != 0 {
+				t.Fatal("expiry sweep restarted before the post-pass interval")
+			}
+			time.Sleep(time.Nanosecond)
+			synctest.Wait()
+			second := <-calls
+			if second.Sub(first) != 3*expirySweepInterval {
+				t.Fatalf("expiry sweep start interval=%s, want %s", second.Sub(first), 3*expirySweepInterval)
+			}
+
+			release <- struct{}{}
+			cancel()
+			synctest.Wait()
+			select {
+			case <-done:
+			default:
+				t.Fatal("canceled expiry loop did not stop")
+			}
+		})
 	})
 }
 
@@ -243,6 +293,7 @@ func TestDueQueueAndTokenFencing(t *testing.T) {
 	if currentToken != reclaimed.Token {
 		t.Fatal("stale actor changed the fresh claim")
 	}
+	t.Run("pending expiry queue and batch", testPendingExpiryQueueAndBatch)
 }
 
 func TestDurableBoundaryRecovery(t *testing.T) {
@@ -387,6 +438,7 @@ func TestDurableBoundaryRecovery(t *testing.T) {
 	if err != nil || staleApplied {
 		t.Fatalf("stale retry applied=%t error=%v", staleApplied, err)
 	}
+	t.Run("expiry durable boundaries", testExpiryDurableBoundaryRecovery)
 }
 
 func TestParentFirstCandidateTerminalRace(t *testing.T) {
@@ -405,6 +457,7 @@ func TestParentFirstCandidateTerminalRace(t *testing.T) {
 			testParentFirstCandidateTerminalRace(t, cfg, order.candidateFirst)
 		})
 	}
+	t.Run("missing expiry observation fencing", testMissingExpiryObservationFencing)
 }
 
 func TestE2ERejectedImages(t *testing.T) {
