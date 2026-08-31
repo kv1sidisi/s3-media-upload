@@ -58,6 +58,9 @@ func run(ctx context.Context, logger *slog.Logger) error {
 				return presignUploadPUT(ctx, presigner, cfg.S3Bucket, key, contentType)
 			}, command)
 		},
+		completeUpload: func(ctx context.Context, uploadID string) (completeUploadResult, error) {
+			return completeUploadByID(ctx, pool, uploadID)
+		},
 		getUpload: func(ctx context.Context, uploadID string) (uploadRepresentation, error) {
 			return getUploadByID(ctx, pool, uploadID)
 		},

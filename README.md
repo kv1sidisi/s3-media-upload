@@ -3,8 +3,9 @@
 `s3-media-upload` is a small Go foundation for a direct-to-S3 media upload service.
 The current slice provides a loopback HTTP process, PostgreSQL schema v1, idempotent
 upload creation, 15-minute direct PUT capabilities, authoritative pending reads, local
-Garage configuration, health probes, structured logs, and process counters. Completion
-and file processing are planned but are not implemented yet.
+Garage configuration, durable asynchronous completion intent, authoritative status
+reads, health probes, structured logs, and process counters. File processing is planned
+but is not implemented yet.
 
 ## Status
 
@@ -13,6 +14,7 @@ and file processing are planned but are not implemented yet.
 - strict loopback-only configuration;
 - forward-only PostgreSQL schema v1;
 - `POST /uploads` with durable idempotency and presigned direct PUT instructions;
+- `POST /uploads/{upload_id}/complete` with restart-safe `finalizing` intent;
 - `GET /uploads/{upload_id}` with an authoritative PostgreSQL representation;
 - `GET /livez`, `GET /readyz`, and `GET /debug/vars`;
 - bounded PostgreSQL and signed S3 readiness checks;
@@ -21,20 +23,22 @@ and file processing are planned but are not implemented yet.
 
 ### Planned
 
-- durable completion, validation, publication, expiry, and object cleanup.
+- validation, publication, time-driven expiry, and object cleanup.
 
 ### Observed
 
 On 2026-08-31, the following passed from a local, uncommitted working tree:
 
-- Go 1.26.7, an empty `gofmt -l` result, `go vet ./...`, and the canonical quick gate;
-- fresh pinned PostgreSQL 18.6 and Garage 2.3.0 startup plus transactional schema v1 migration;
+- pinned Go 1.26.7, an empty `gofmt -l` result, `go vet ./...`, and the canonical quick gate;
+- healthy pinned PostgreSQL 18.6 and Garage 2.3.0 with schema v1 present;
 - the complete root-package test binary, built under a hard no-swap 2560 MiB limit and
   executed against PostgreSQL and Garage under a hard no-swap 256 MiB limit
-  (`GOMEMLIMIT=230MiB`), with shuffle seed `1788187538343055235` and result `PASS`.
+  (`GOMEMLIMIT=230MiB`), with shuffle seed `1788195547231866079` and result `PASS`;
+- the complete race suite under a hard no-swap 2560 MiB limit, with zero race reports
+  and result `ok` in 4.731 seconds.
 
-This is local ticket-02 evidence, not evidence from an immutable revision. No race gate,
-manual demo, live AWS run, deployment, or completed/ready upload flow has been observed.
+This is local ticket-03 evidence, not evidence from an immutable revision. A manual
+demo, live AWS, deployment, and a validated ready upload flow have not been observed.
 
 ## Prerequisites
 
@@ -85,10 +89,26 @@ curl --fail-with-body \
 The response contains an opaque `upload_request`. Send the image directly to its URL
 with the returned method and complete headers map, without following redirects. Exact
 create replays return the same upload resource and a newly authorized URL while the
-write window is open. A successful storage PUT still leaves the resource `pending`;
-`GET /uploads/{upload_id}` reads that state from PostgreSQL and never returns a storage
-URL, bucket, object key, ETag, digest, claim, or retry metadata. The API never accepts
-or proxies image bytes.
+write window is open. A successful storage PUT still leaves the resource `pending`.
+
+After the PUT completes, durably submit asynchronous completion intent with an empty
+body:
+
+```sh
+curl --fail-with-body \
+  --request POST \
+  --header 'Content-Length: 0' \
+  "http://127.0.0.1:8080/uploads/${UPLOAD_ID:?set from the create response}/complete"
+```
+
+A timely request returns `202` and `finalizing`; an exact replay also returns `202` and
+wakes future recovery without changing the original completion time. Completion does
+not inspect S3, validate bytes, or mean that media is ready. A request at or after the
+upload deadline atomically expires the upload and records staging cleanup work.
+
+`GET /uploads/{upload_id}` reads the current state from PostgreSQL and never returns a
+storage URL, bucket, object key, ETag, digest, completion timestamp, claim, or retry
+metadata. The API never accepts or proxies image bytes.
 
 ## Configuration
 
@@ -130,12 +150,13 @@ rmdir .ticket01-bin
 Cold compilation did not fit the 256 MiB execution envelope, including serialized and
 reduced-compiler-memory attempts. Compilation therefore has its own 2560 MiB envelope;
 the resulting binary still executes the complete integration suite under 256 MiB. The
-race gate is reserved for later concurrency slices.
+race suite executes separately under the 2560 MiB envelope.
 
 ## Security boundary and limitations
 
 This service has no authentication, TLS, rate limiting, quota enforcement, or public
 upload controls. Do not expose it to a LAN or the Internet. The bucket must remain
 private, and credentials, DSNs, presigned URLs, request data, and object identifiers
-must not enter logs. This repository does not claim a completed or ready upload flow,
-deployment, live AWS verification, broad S3 compatibility, or production readiness.
+must not enter logs. This repository does not claim validated publication, a ready
+upload flow, deployment, live AWS verification, broad S3 compatibility, or production
+readiness.

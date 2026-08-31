@@ -76,6 +76,12 @@ const uploadRecordColumns = `
 	upload_deadline,
 	max_write_expires_at`
 
+var errCompletionOutcomeUnknown = errors.New("completion outcome unknown")
+
+type completionRecovery struct {
+	finalizingDueBy *time.Time
+}
+
 func createOrReplayUpload(
 	ctx context.Context,
 	pool *pgxpool.Pool,
@@ -313,6 +319,217 @@ func recoverUnknownUploadCommit(
 	}, nil
 }
 
+func completeUploadByID(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	uploadID string,
+) (completeUploadResult, error) {
+	result, recovery, err := completeUploadAttempt(ctx, pool, uploadID)
+	if !errors.Is(err, errCompletionOutcomeUnknown) {
+		return result, err
+	}
+	return recoverCompletionOutcome(ctx, pool, uploadID, recovery)
+}
+
+func completeUploadAttempt(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	uploadID string,
+) (completeUploadResult, completionRecovery, error) {
+	tx, databaseContext, cancelDatabase, err := beginUploadTransaction(ctx, pool)
+	if err != nil {
+		return completeUploadResult{}, completionRecovery{}, errServiceUnavailable
+	}
+	defer func() {
+		_ = tx.Rollback(databaseContext)
+		cancelDatabase()
+	}()
+
+	locked, err := scanStoredUpload(tx.QueryRow(databaseContext, `
+		SELECT `+uploadRecordColumns+`, created_at
+		FROM uploads
+		WHERE upload_id::text = $1
+		FOR UPDATE`,
+		uploadID,
+	))
+	if errors.Is(err, pgx.ErrNoRows) {
+		if err := tx.Rollback(databaseContext); err != nil {
+			cancelDatabase()
+			return completeUploadResult{}, completionRecovery{}, errServiceUnavailable
+		}
+		cancelDatabase()
+		return completeUploadResult{}, completionRecovery{}, errUploadNotFound
+	}
+	if err != nil {
+		return completeUploadResult{}, completionRecovery{}, errServiceUnavailable
+	}
+	if err := tx.QueryRow(databaseContext, "SELECT clock_timestamp()").Scan(&locked.DatabaseNow); err != nil {
+		return completeUploadResult{}, completionRecovery{}, errServiceUnavailable
+	}
+	locked.DatabaseNow = locked.DatabaseNow.UTC()
+
+	result := completeUploadResult{Upload: locked.Upload}
+	recovery := completionRecovery{}
+	var rowsAffected int64
+	switch locked.Upload.State {
+	case "pending":
+		if locked.DatabaseNow.Before(locked.Upload.UploadDeadline) {
+			commandTag, updateErr := tx.Exec(databaseContext, `
+				UPDATE uploads
+				SET state = 'finalizing',
+				    completion_requested_at = $2::timestamptz,
+				    reconcile_after = $2::timestamptz
+				WHERE upload_id = $1::uuid
+				  AND state = 'pending'
+				  AND upload_deadline > $2::timestamptz`,
+				locked.Upload.UploadID,
+				locked.DatabaseNow,
+			)
+			err = updateErr
+			rowsAffected = commandTag.RowsAffected()
+			result.Upload.State = "finalizing"
+			result.Transition = "pending_to_finalizing"
+		} else {
+			commandTag, updateErr := tx.Exec(databaseContext, `
+				UPDATE uploads
+				SET state = 'expired',
+				    terminal_at = $2::timestamptz,
+				    expiry_reason = 'upload_deadline_elapsed'
+				WHERE upload_id = $1::uuid
+				  AND state = 'pending'
+				  AND upload_deadline <= $2::timestamptz`,
+				locked.Upload.UploadID,
+				locked.DatabaseNow,
+			)
+			err = updateErr
+			rowsAffected = commandTag.RowsAffected()
+			if err == nil && rowsAffected == 1 {
+				_, err = tx.Exec(databaseContext, `
+					INSERT INTO cleanup_tombstones (
+						object_key,
+						upload_id,
+						candidate_sha256,
+						created_at,
+						delete_not_before,
+						next_attempt_at
+					)
+					VALUES ($1::text, $2::uuid, NULL, $3::timestamptz, $4::timestamptz, $4::timestamptz)`,
+					locked.StagingKey,
+					locked.Upload.UploadID,
+					locked.DatabaseNow,
+					locked.MaxWriteExpiresAt,
+				)
+			}
+			result.Upload.State = "expired"
+			result.Upload.Failure = &uploadFailure{Code: "upload_expired"}
+			result.Transition = "pending_to_expired"
+		}
+	case "finalizing":
+		recovery.finalizingDueBy = &locked.DatabaseNow
+		commandTag, updateErr := tx.Exec(databaseContext, `
+			UPDATE uploads
+			SET reconcile_after = LEAST(reconcile_after, $2::timestamptz)
+			WHERE upload_id = $1::uuid
+			  AND state = 'finalizing'`,
+			locked.Upload.UploadID,
+			locked.DatabaseNow,
+		)
+		err = updateErr
+		rowsAffected = commandTag.RowsAffected()
+	case "ready", "rejected", "expired":
+		if err := tx.Rollback(databaseContext); err != nil {
+			cancelDatabase()
+			return completeUploadResult{}, completionRecovery{}, errServiceUnavailable
+		}
+		cancelDatabase()
+		result.Upload = decorateUploadRepresentation(result.Upload)
+		return result, completionRecovery{}, nil
+	default:
+		return completeUploadResult{}, completionRecovery{}, errServiceUnavailable
+	}
+	if err != nil {
+		return completeUploadResult{}, completionRecovery{}, errServiceUnavailable
+	}
+	if rowsAffected != 1 {
+		_ = tx.Rollback(databaseContext)
+		cancelDatabase()
+		return completeUploadResult{}, recovery, errCompletionOutcomeUnknown
+	}
+	if err := tx.Commit(databaseContext); err != nil {
+		cancelDatabase()
+		return completeUploadResult{}, recovery, errCompletionOutcomeUnknown
+	}
+	cancelDatabase()
+	return result, completionRecovery{}, nil
+}
+
+func recoverCompletionOutcome(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	uploadID string,
+	recovery completionRecovery,
+) (completeUploadResult, error) {
+	current, reconcileAfter, err := readCompletionUpload(ctx, pool, uploadID)
+	if err != nil {
+		return completeUploadResult{}, errServiceUnavailable
+	}
+	if completionOutcomeIsDurable(current.Upload.State, reconcileAfter, recovery) {
+		return completeUploadResult{Upload: current.Upload}, nil
+	}
+	result, secondRecovery, err := completeUploadAttempt(ctx, pool, uploadID)
+	if !errors.Is(err, errCompletionOutcomeUnknown) {
+		if err != nil {
+			return completeUploadResult{}, errServiceUnavailable
+		}
+		return result, nil
+	}
+	current, reconcileAfter, err = readCompletionUpload(ctx, pool, uploadID)
+	if err != nil || !completionOutcomeIsDurable(current.Upload.State, reconcileAfter, secondRecovery) {
+		return completeUploadResult{}, errServiceUnavailable
+	}
+	return completeUploadResult{Upload: current.Upload}, nil
+}
+
+func readCompletionUpload(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	uploadID string,
+) (storedUpload, *time.Time, error) {
+	databaseContext, cancelDatabase := context.WithTimeout(ctx, uploadDatabaseTimeout)
+	defer cancelDatabase()
+	var reconcileAfter *time.Time
+	upload, err := scanStoredUpload(pool.QueryRow(databaseContext, `
+		SELECT `+uploadRecordColumns+`, clock_timestamp(), reconcile_after
+		FROM uploads
+		WHERE upload_id::text = $1`,
+		uploadID,
+	), &reconcileAfter)
+	if err != nil {
+		return storedUpload{}, nil, err
+	}
+	if reconcileAfter != nil {
+		utc := reconcileAfter.UTC()
+		reconcileAfter = &utc
+	}
+	return upload, reconcileAfter, nil
+}
+
+func completionOutcomeIsDurable(
+	state string,
+	reconcileAfter *time.Time,
+	recovery completionRecovery,
+) bool {
+	switch state {
+	case "finalizing":
+		return recovery.finalizingDueBy == nil ||
+			(reconcileAfter != nil && !reconcileAfter.After(*recovery.finalizingDueBy))
+	case "ready", "rejected", "expired":
+		return true
+	default:
+		return false
+	}
+}
+
 func getUploadByID(
 	ctx context.Context,
 	pool *pgxpool.Pool,
@@ -345,7 +562,7 @@ func getUploadByID(
 		return uploadRepresentation{}, errServiceUnavailable
 	}
 	upload.UploadDeadline = upload.UploadDeadline.UTC()
-	return upload, nil
+	return decorateUploadRepresentation(upload), nil
 }
 
 func beginUploadTransaction(
@@ -397,7 +614,15 @@ func scanStoredUpload(row pgx.Row, trailing ...any) (storedUpload, error) {
 	upload.Upload.UploadDeadline = upload.Upload.UploadDeadline.UTC()
 	upload.MaxWriteExpiresAt = upload.MaxWriteExpiresAt.UTC()
 	upload.DatabaseNow = upload.DatabaseNow.UTC()
+	upload.Upload = decorateUploadRepresentation(upload.Upload)
 	return upload, nil
+}
+
+func decorateUploadRepresentation(upload uploadRepresentation) uploadRepresentation {
+	if upload.State == "expired" {
+		upload.Failure = &uploadFailure{Code: "upload_expired"}
+	}
+	return upload
 }
 
 func uploadMatchesCommand(upload storedUpload, command createUploadCommand) bool {

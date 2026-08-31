@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"expvar"
 	"io"
 	"log/slog"
 	"net"
@@ -236,33 +237,56 @@ func TestCreateUploadOutcomeContract(t *testing.T) {
 	}
 }
 
-func TestUploadDispatcherAndPendingRepresentation(t *testing.T) {
+func TestExactDispatcherAndRepresentation(t *testing.T) {
 	deadline := time.Date(2026, time.August, 31, 12, 0, 0, 0, time.UTC)
 	tests := []struct {
-		name       string
-		method     string
-		path       string
-		wantStatus int
-		wantAllow  string
-		wantGets   int64
+		name          string
+		method        string
+		path          string
+		wantStatus    int
+		wantAllow     string
+		wantGets      int64
+		wantCompletes int64
+		wantState     string
+		wantLocation  string
 	}{
-		{"get pending", http.MethodGet, "/uploads/opaque-id", http.StatusOK, "", 1},
-		{"HEAD is not GET", http.MethodHead, "/uploads/opaque-id", http.StatusMethodNotAllowed, http.MethodGet, 0},
-		{"wrong status method", http.MethodPost, "/uploads/opaque-id", http.StatusMethodNotAllowed, http.MethodGet, 0},
-		{"GET create route", http.MethodGet, "/uploads", http.StatusMethodNotAllowed, http.MethodPost, 0},
-		{"HEAD create route", http.MethodHead, "/uploads", http.StatusMethodNotAllowed, http.MethodPost, 0},
-		{"trailing create slash", http.MethodPost, "/uploads/", http.StatusNotFound, "", 0},
-		{"empty status segment", http.MethodGet, "/uploads/", http.StatusNotFound, "", 0},
-		{"trailing status slash", http.MethodGet, "/uploads/opaque-id/", http.StatusNotFound, "", 0},
-		{"double slash", http.MethodGet, "/uploads//opaque-id", http.StatusNotFound, "", 0},
-		{"cleanable path", http.MethodGet, "/uploads/opaque-id/../other", http.StatusNotFound, "", 0},
-		{"unknown path", http.MethodGet, "/upload/opaque-id", http.StatusNotFound, "", 0},
+		{"get pending", http.MethodGet, "/uploads/opaque-id", http.StatusOK, "", 1, 0, "pending", ""},
+		{"complete", http.MethodPost, "/uploads/opaque-id/complete", http.StatusAccepted, "", 0, 1, "finalizing", "/uploads/opaque-id"},
+		{"HEAD is not GET", http.MethodHead, "/uploads/opaque-id", http.StatusMethodNotAllowed, http.MethodGet, 0, 0, "", ""},
+		{"wrong status method", http.MethodPost, "/uploads/opaque-id", http.StatusMethodNotAllowed, http.MethodGet, 0, 0, "", ""},
+		{"GET complete route", http.MethodGet, "/uploads/opaque-id/complete", http.StatusMethodNotAllowed, http.MethodPost, 0, 0, "", ""},
+		{"HEAD complete route", http.MethodHead, "/uploads/opaque-id/complete", http.StatusMethodNotAllowed, http.MethodPost, 0, 0, "", ""},
+		{"GET create route", http.MethodGet, "/uploads", http.StatusMethodNotAllowed, http.MethodPost, 0, 0, "", ""},
+		{"HEAD create route", http.MethodHead, "/uploads", http.StatusMethodNotAllowed, http.MethodPost, 0, 0, "", ""},
+		{"trailing create slash", http.MethodPost, "/uploads/", http.StatusNotFound, "", 0, 0, "", ""},
+		{"empty status segment", http.MethodGet, "/uploads/", http.StatusNotFound, "", 0, 0, "", ""},
+		{"trailing status slash", http.MethodGet, "/uploads/opaque-id/", http.StatusNotFound, "", 0, 0, "", ""},
+		{"trailing complete slash", http.MethodPost, "/uploads/opaque-id/complete/", http.StatusNotFound, "", 0, 0, "", ""},
+		{"empty completion ID", http.MethodPost, "/uploads//complete", http.StatusNotFound, "", 0, 0, "", ""},
+		{"double slash", http.MethodGet, "/uploads//opaque-id", http.StatusNotFound, "", 0, 0, "", ""},
+		{"cleanable path", http.MethodGet, "/uploads/opaque-id/../other", http.StatusNotFound, "", 0, 0, "", ""},
+		{"cleanable complete path", http.MethodPost, "/uploads/opaque-id/../complete", http.StatusNotFound, "", 0, 0, "", ""},
+		{"unknown path", http.MethodGet, "/upload/opaque-id", http.StatusNotFound, "", 0, 0, "", ""},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			var gets atomic.Int64
+			var completes atomic.Int64
 			app := &application{
 				logger: slog.New(slog.NewJSONHandler(io.Discard, nil)),
+				completeUpload: func(_ context.Context, uploadID string) (completeUploadResult, error) {
+					completes.Add(1)
+					if uploadID != "opaque-id" {
+						t.Fatalf("decoded completion upload ID=%q", uploadID)
+					}
+					return completeUploadResult{Upload: uploadRepresentation{
+						UploadID:            uploadID,
+						State:               "finalizing",
+						DeclaredSizeBytes:   11,
+						DeclaredContentType: "image/jpeg",
+						UploadDeadline:      deadline,
+					}}, nil
+				},
 				getUpload: func(_ context.Context, uploadID string) (uploadRepresentation, error) {
 					gets.Add(1)
 					if uploadID != "opaque-id" {
@@ -290,16 +314,19 @@ func TestUploadDispatcherAndPendingRepresentation(t *testing.T) {
 			if gets.Load() != test.wantGets {
 				t.Fatalf("get calls=%d, want %d", gets.Load(), test.wantGets)
 			}
+			if completes.Load() != test.wantCompletes {
+				t.Fatalf("complete calls=%d, want %d", completes.Load(), test.wantCompletes)
+			}
 			if recorder.Header().Get("Cache-Control") != "no-store" || recorder.Header().Get("Content-Type") != "application/json" {
 				t.Fatalf("unexpected response headers: %v", recorder.Header())
 			}
 			if test.wantStatus >= 300 && test.wantStatus < 400 {
 				t.Fatal("dispatcher redirected a non-exact path")
 			}
-			if recorder.Header().Get("Location") != "" {
-				t.Fatalf("dispatcher returned unexpected Location=%q", recorder.Header().Get("Location"))
+			if recorder.Header().Get("Location") != test.wantLocation {
+				t.Fatalf("Location=%q, want %q", recorder.Header().Get("Location"), test.wantLocation)
 			}
-			if test.wantStatus != http.StatusOK {
+			if test.wantState == "" {
 				return
 			}
 			var got map[string]any
@@ -308,7 +335,7 @@ func TestUploadDispatcherAndPendingRepresentation(t *testing.T) {
 			}
 			want := map[string]any{
 				"upload_id":             "opaque-id",
-				"state":                 "pending",
+				"state":                 test.wantState,
 				"declared_size_bytes":   float64(11),
 				"declared_content_type": "image/jpeg",
 				"upload_deadline":       deadline.Format(time.RFC3339),
@@ -336,18 +363,127 @@ func TestUploadDispatcherAndPendingRepresentation(t *testing.T) {
 		t.Fatalf("unknown upload response: status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 
-	var getCalls atomic.Int64
+	completionOutcomes := []struct {
+		name         string
+		state        string
+		failure      *uploadFailure
+		err          error
+		wantStatus   int
+		wantCode     string
+		wantLocation string
+	}{
+		{"finalizing replay", "finalizing", nil, nil, http.StatusAccepted, "", "/uploads/" + testUploadID},
+		{"ready replay", "ready", nil, nil, http.StatusOK, "", ""},
+		{"rejected replay", "rejected", &uploadFailure{Code: "invalid_image"}, nil, http.StatusOK, "", ""},
+		{"expired replay", "expired", &uploadFailure{Code: "upload_expired"}, nil, http.StatusOK, "", ""},
+		{"unknown upload", "", nil, errUploadNotFound, http.StatusNotFound, "upload_not_found", ""},
+		{"dependency unavailable", "", nil, errServiceUnavailable, http.StatusServiceUnavailable, "service_unavailable", ""},
+		{"internal failure", "", nil, errors.New("raw-database-secret"), http.StatusInternalServerError, "internal_error", ""},
+	}
+	for _, test := range completionOutcomes {
+		t.Run(test.name, func(t *testing.T) {
+			app := &application{
+				logger: slog.New(slog.NewJSONHandler(io.Discard, nil)),
+				completeUpload: func(context.Context, string) (completeUploadResult, error) {
+					return completeUploadResult{Upload: uploadRepresentation{
+						UploadID:            testUploadID,
+						State:               test.state,
+						DeclaredSizeBytes:   11,
+						DeclaredContentType: "image/jpeg",
+						UploadDeadline:      deadline,
+						Failure:             test.failure,
+					}}, test.err
+				},
+			}
+			recorder := httptest.NewRecorder()
+			app.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/uploads/"+testUploadID+"/complete", nil))
+			if recorder.Code != test.wantStatus || recorder.Header().Get("Location") != test.wantLocation || recorder.Header().Get("Cache-Control") != "no-store" {
+				t.Fatalf("status=%d Location=%q headers=%v body=%s", recorder.Code, recorder.Header().Get("Location"), recorder.Header(), recorder.Body.String())
+			}
+			if test.wantCode != "" {
+				if code := responseErrorCode(t, recorder.Body.Bytes()); code != test.wantCode {
+					t.Fatalf("error code=%q, want %q", code, test.wantCode)
+				}
+				if strings.Contains(recorder.Body.String(), "raw-database-secret") {
+					t.Fatal("completion error disclosed raw dependency error")
+				}
+				return
+			}
+			var representation map[string]any
+			if err := json.Unmarshal(recorder.Body.Bytes(), &representation); err != nil {
+				t.Fatal("decode completion representation")
+			}
+			if test.failure != nil {
+				failure, ok := representation["failure"].(map[string]any)
+				if !ok || failure["code"] != test.failure.Code {
+					t.Fatalf("terminal failure=%#v", representation["failure"])
+				}
+			}
+			for _, forbidden := range []string{"upload_request", "completion_requested_at", "reconcile_after", "staging", "claim", "retry"} {
+				if strings.Contains(strings.ToLower(recorder.Body.String()), forbidden) {
+					t.Fatalf("completion representation disclosed %q", forbidden)
+				}
+			}
+		})
+	}
+
+	var bodylessCalls atomic.Int64
 	app = &application{
 		logger: slog.New(slog.NewJSONHandler(io.Discard, nil)),
 		getUpload: func(context.Context, string) (uploadRepresentation, error) {
-			getCalls.Add(1)
+			bodylessCalls.Add(1)
 			return uploadRepresentation{}, nil
+		},
+		completeUpload: func(context.Context, string) (completeUploadResult, error) {
+			bodylessCalls.Add(1)
+			return completeUploadResult{}, nil
 		},
 	}
 	recorder = httptest.NewRecorder()
 	app.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/uploads/opaque-id", strings.NewReader(`{}`)))
-	if recorder.Code != http.StatusBadRequest || responseErrorCode(t, recorder.Body.Bytes()) != "invalid_request" || getCalls.Load() != 0 {
-		t.Fatalf("non-empty GET body reached status read: status=%d calls=%d body=%s", recorder.Code, getCalls.Load(), recorder.Body.String())
+	if recorder.Code != http.StatusBadRequest || responseErrorCode(t, recorder.Body.Bytes()) != "invalid_request" || bodylessCalls.Load() != 0 {
+		t.Fatalf("non-empty GET body reached status read: status=%d calls=%d body=%s", recorder.Code, bodylessCalls.Load(), recorder.Body.String())
+	}
+	recorder = httptest.NewRecorder()
+	app.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/uploads/opaque-id/complete", strings.NewReader(" ")))
+	if recorder.Code != http.StatusBadRequest || responseErrorCode(t, recorder.Body.Bytes()) != "invalid_request" || bodylessCalls.Load() != 0 {
+		t.Fatalf("non-empty completion body reached transaction: status=%d calls=%d body=%s", recorder.Code, bodylessCalls.Load(), recorder.Body.String())
+	}
+
+	var logs bytes.Buffer
+	var completionCalls atomic.Int64
+	transitionCounter := serviceMetrics.Get("upload_transitions_total").(*expvar.Map).Get("pending_to_finalizing").(*expvar.Int)
+	counterBefore := transitionCounter.Value()
+	app = &application{
+		logger: slog.New(slog.NewJSONHandler(&logs, nil)),
+		completeUpload: func(context.Context, string) (completeUploadResult, error) {
+			transition := ""
+			if completionCalls.Add(1) == 1 {
+				transition = "pending_to_finalizing"
+			}
+			return completeUploadResult{Upload: uploadRepresentation{
+				UploadID:            testUploadID,
+				State:               "finalizing",
+				DeclaredSizeBytes:   11,
+				DeclaredContentType: "image/jpeg",
+				UploadDeadline:      deadline,
+			}, Transition: transition}, nil
+		},
+	}
+	for range 2 {
+		recorder = httptest.NewRecorder()
+		app.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/uploads/"+testUploadID+"/complete", nil))
+		if recorder.Code != http.StatusAccepted {
+			t.Fatalf("completion replay status=%d body=%s", recorder.Code, recorder.Body.String())
+		}
+	}
+	if transitionCounter.Value()-counterBefore != 1 || strings.Count(logs.String(), `"msg":"upload.transition"`) != 1 {
+		t.Fatalf("transition counter delta=%d logs=%s", transitionCounter.Value()-counterBefore, logs.String())
+	}
+	for _, forbidden := range []string{"X-Amz-", "staging/", testIdempotencyKey, "raw-database-secret"} {
+		if strings.Contains(logs.String(), forbidden) {
+			t.Fatalf("completion logs disclosed %q", forbidden)
+		}
 	}
 }
 
@@ -725,7 +861,7 @@ func TestIntegrationGarageUploadWireContract(t *testing.T) {
 	assertGarageObject(t, ctx, storage, cfg.S3Bucket, key, bodyB, "image/png")
 }
 
-func TestIntegrationCreateDirectPUTRemainsPending(t *testing.T) {
+func TestE2EHappyPathAndExactReplay(t *testing.T) {
 	if testing.Short() {
 		t.Skip("requires migrated PostgreSQL and Garage")
 	}
@@ -752,6 +888,9 @@ func TestIntegrationCreateDirectPUTRemainsPending(t *testing.T) {
 			return createOrReplayUpload(ctx, pool, func(ctx context.Context, key, contentType string) (uploadRequest, error) {
 				return presignUploadPUT(ctx, presigner, cfg.S3Bucket, key, contentType)
 			}, command)
+		},
+		completeUpload: func(ctx context.Context, uploadID string) (completeUploadResult, error) {
+			return completeUploadByID(ctx, pool, uploadID)
 		},
 		getUpload: func(ctx context.Context, uploadID string) (uploadRepresentation, error) {
 			return getUploadByID(ctx, pool, uploadID)
@@ -821,6 +960,31 @@ func TestIntegrationCreateDirectPUTRemainsPending(t *testing.T) {
 			created.DeclaredContentType,
 		)
 	}
+	replayRequest, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		"http://"+listener.Addr().String()+"/uploads",
+		strings.NewReader(`{"size_bytes":21,"content_type":"image/png"}`),
+	)
+	if err != nil {
+		t.Fatal("build exact replay request")
+	}
+	replayRequest.Header.Set("Idempotency-Key", idempotencyKey)
+	replayRequest.Header.Set("Content-Type", "application/json")
+	replayResponse, err := client.Do(replayRequest)
+	if err != nil {
+		t.Fatal("send exact replay request")
+	}
+	replayBody, readErr := io.ReadAll(io.LimitReader(replayResponse.Body, 32<<10))
+	replayResponse.Body.Close()
+	if readErr != nil {
+		t.Fatal("read exact replay response")
+	}
+	var replayed uploadRepresentation
+	if replayResponse.StatusCode != http.StatusOK || replayResponse.Header.Get("Location") != "" ||
+		json.Unmarshal(replayBody, &replayed) != nil || replayed.UploadID != created.UploadID || replayed.UploadRequest == nil {
+		t.Fatalf("exact replay mismatch: status=%d Location=%q body=%s", replayResponse.StatusCode, replayResponse.Header.Get("Location"), replayBody)
+	}
 	objectKey := "staging/" + created.UploadID
 	t.Cleanup(func() {
 		cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -834,7 +998,7 @@ func TestIntegrationCreateDirectPUTRemainsPending(t *testing.T) {
 	})
 
 	rawBody := []byte("direct-put-raw-bytes!")
-	if status := rawPresignedPUT(t, ctx, client, *created.UploadRequest, rawBody, ""); status != http.StatusOK {
+	if status := rawPresignedPUT(t, ctx, client, *replayed.UploadRequest, rawBody, ""); status != http.StatusOK {
 		t.Fatalf("direct PUT status=%d", status)
 	}
 	getResponse, err := client.Get("http://" + listener.Addr().String() + location)
@@ -879,10 +1043,83 @@ func TestIntegrationCreateDirectPUTRemainsPending(t *testing.T) {
 		WHERE upload_id = $1::uuid`, created.UploadID).Scan(&state, &horizon); err != nil {
 		t.Fatal("read durable upload after direct PUT")
 	}
-	if state != "pending" || !horizon.Equal(created.UploadRequest.ExpiresAt) {
-		t.Fatalf("direct PUT changed DB state=%q or horizon=%s, want %s", state, horizon, created.UploadRequest.ExpiresAt)
+	if state != "pending" || !horizon.Equal(replayed.UploadRequest.ExpiresAt) {
+		t.Fatalf("direct PUT changed DB state=%q or horizon=%s, want %s", state, horizon, replayed.UploadRequest.ExpiresAt)
 	}
 	assertGarageObject(t, ctx, storage, cfg.S3Bucket, objectKey, rawBody, "image/png")
+
+	complete := func(idempotencyHeader bool) map[string]any {
+		t.Helper()
+		request, err := http.NewRequestWithContext(
+			ctx,
+			http.MethodPost,
+			"http://"+listener.Addr().String()+location+"/complete",
+			nil,
+		)
+		if err != nil {
+			t.Fatal("build completion request")
+		}
+		if idempotencyHeader {
+			request.Header.Set("Idempotency-Key", testOtherIdempotencyKey)
+		}
+		response, err := client.Do(request)
+		if err != nil {
+			t.Fatal("send completion request")
+		}
+		body, readErr := io.ReadAll(io.LimitReader(response.Body, 32<<10))
+		response.Body.Close()
+		if readErr != nil {
+			t.Fatal("read completion response")
+		}
+		if response.StatusCode != http.StatusAccepted || response.Header.Get("Location") != location ||
+			response.Header.Get("Content-Type") != "application/json" || response.Header.Get("Cache-Control") != "no-store" {
+			t.Fatalf("completion response mismatch: status=%d Location=%q headers=%v body=%s", response.StatusCode, response.Header.Get("Location"), response.Header, body)
+		}
+		var representation map[string]any
+		if err := json.Unmarshal(body, &representation); err != nil || len(representation) != 5 ||
+			representation["upload_id"] != created.UploadID || representation["state"] != "finalizing" {
+			t.Fatalf("completion representation=%#v decode_error=%v", representation, err)
+		}
+		for _, forbidden := range []string{"upload_request", "url", "staging", "completion_requested_at", "reconcile_after", "claim", "retry", "X-Amz-"} {
+			if strings.Contains(strings.ToLower(string(body)), strings.ToLower(forbidden)) {
+				t.Fatalf("completion representation disclosed %q", forbidden)
+			}
+		}
+		return representation
+	}
+	complete(false)
+	var completionRequestedAt time.Time
+	var reconcileAfter time.Time
+	if err := pool.QueryRow(ctx, `
+		SELECT completion_requested_at, reconcile_after
+		FROM uploads
+		WHERE upload_id = $1::uuid`, created.UploadID).Scan(&completionRequestedAt, &reconcileAfter); err != nil {
+		t.Fatal("read durable completion intent")
+	}
+	if !completionRequestedAt.Equal(reconcileAfter) {
+		t.Fatalf("initial completion=%s reconcile_after=%s", completionRequestedAt, reconcileAfter)
+	}
+	complete(true)
+	var replayedCompletionRequestedAt time.Time
+	var replayedReconcileAfter time.Time
+	if err := pool.QueryRow(ctx, `
+		SELECT completion_requested_at, reconcile_after
+		FROM uploads
+		WHERE upload_id = $1::uuid`, created.UploadID).Scan(&replayedCompletionRequestedAt, &replayedReconcileAfter); err != nil {
+		t.Fatal("read replayed completion intent")
+	}
+	if !replayedCompletionRequestedAt.Equal(completionRequestedAt) || replayedReconcileAfter.After(reconcileAfter) {
+		t.Fatalf("completion replay changed intent=%t or delayed reconcile from %s to %s", !replayedCompletionRequestedAt.Equal(completionRequestedAt), reconcileAfter, replayedReconcileAfter)
+	}
+	finalStatus, err := client.Get("http://" + listener.Addr().String() + location)
+	if err != nil {
+		t.Fatal("GET finalizing upload")
+	}
+	finalStatusBody, readErr := io.ReadAll(io.LimitReader(finalStatus.Body, 32<<10))
+	finalStatus.Body.Close()
+	if readErr != nil || finalStatus.StatusCode != http.StatusOK || !strings.Contains(string(finalStatusBody), `"state":"finalizing"`) {
+		t.Fatalf("finalizing status mismatch: status=%d read_error=%v body=%s", finalStatus.StatusCode, readErr, finalStatusBody)
+	}
 }
 
 type createCallOutcome struct {
@@ -1079,6 +1316,16 @@ func cleanupUploadByIdempotencyKey(t *testing.T, pool *pgxpool.Pool, idempotency
 		return
 	}
 	defer tx.Rollback(context.Background())
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM cleanup_tombstones
+		WHERE upload_id IN (
+			SELECT upload_id
+			FROM uploads
+			WHERE idempotency_key = $1::uuid
+		)`, idempotencyKey); err != nil {
+		t.Error("delete test upload tombstones")
+		return
+	}
 	if _, err := tx.Exec(ctx, `DELETE FROM uploads WHERE idempotency_key = $1::uuid`, idempotencyKey); err != nil {
 		t.Error("delete test upload")
 		return

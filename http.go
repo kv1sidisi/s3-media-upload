@@ -29,12 +29,13 @@ var (
 )
 
 type application struct {
-	logger       *slog.Logger
-	postgresPing func(context.Context) error
-	s3HeadBucket func(context.Context) error
-	createUpload func(context.Context, createUploadCommand) (createUploadResult, error)
-	getUpload    func(context.Context, string) (uploadRepresentation, error)
-	stopping     atomic.Bool
+	logger         *slog.Logger
+	postgresPing   func(context.Context) error
+	s3HeadBucket   func(context.Context) error
+	createUpload   func(context.Context, createUploadCommand) (createUploadResult, error)
+	completeUpload func(context.Context, string) (completeUploadResult, error)
+	getUpload      func(context.Context, string) (uploadRepresentation, error)
+	stopping       atomic.Bool
 }
 
 type createUploadCommand struct {
@@ -57,11 +58,21 @@ type uploadRepresentation struct {
 	DeclaredContentType string         `json:"declared_content_type"`
 	UploadDeadline      time.Time      `json:"upload_deadline"`
 	UploadRequest       *uploadRequest `json:"upload_request,omitempty"`
+	Failure             *uploadFailure `json:"failure,omitempty"`
+}
+
+type uploadFailure struct {
+	Code string `json:"code"`
 }
 
 type createUploadResult struct {
 	Upload  uploadRepresentation
 	Created bool
+}
+
+type completeUploadResult struct {
+	Upload     uploadRepresentation
+	Transition string
 }
 
 type statusRecorder struct {
@@ -91,7 +102,7 @@ func (a *application) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 	loggedUploadID := ""
 	errorCode := ""
 	allowedMethod := http.MethodGet
-	if route == "/uploads" {
+	if route == "/uploads" || route == "/uploads/{upload_id}/complete" {
 		allowedMethod = http.MethodPost
 	}
 
@@ -119,6 +130,8 @@ func (a *application) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 		expvar.Handler().ServeHTTP(recorder, request)
 	case route == "/uploads":
 		loggedUploadID, errorCode = a.serveCreateUpload(recorder, request)
+	case route == "/uploads/{upload_id}/complete":
+		loggedUploadID, errorCode = a.serveCompleteUpload(recorder, request, uploadID)
 	case route == "/uploads/{upload_id}":
 		loggedUploadID, errorCode = a.serveGetUpload(recorder, request, uploadID)
 	}
@@ -153,6 +166,13 @@ func applicationRoute(path string) (string, string) {
 	const prefix = "/uploads/"
 	if strings.HasPrefix(path, prefix) {
 		uploadID := strings.TrimPrefix(path, prefix)
+		if strings.HasSuffix(uploadID, "/complete") {
+			uploadID = strings.TrimSuffix(uploadID, "/complete")
+			if uploadID != "" && !strings.Contains(uploadID, "/") {
+				return "/uploads/{upload_id}/complete", uploadID
+			}
+			return "", ""
+		}
 		if uploadID != "" && !strings.Contains(uploadID, "/") {
 			return "/uploads/{upload_id}", uploadID
 		}
@@ -290,6 +310,64 @@ func decodeCreateUploadBody(encoded []byte) (createUploadCommand, bool) {
 		return createUploadCommand{}, false
 	}
 	return command, true
+}
+
+func (a *application) serveCompleteUpload(writer http.ResponseWriter, request *http.Request, uploadID string) (string, string) {
+	body := http.MaxBytesReader(writer, request.Body, 0)
+	_, err := io.ReadAll(body)
+	_ = body.Close()
+	if err != nil {
+		writeError(writer, http.StatusBadRequest, "invalid_request", "request body must be empty")
+		return "", "invalid_request"
+	}
+
+	result, err := a.completeUpload(request.Context(), uploadID)
+	if err != nil {
+		switch {
+		case errors.Is(err, errUploadNotFound):
+			writeError(writer, http.StatusNotFound, "upload_not_found", "upload not found")
+			return "", "upload_not_found"
+		case errors.Is(err, errServiceUnavailable):
+			writeError(writer, http.StatusServiceUnavailable, "service_unavailable", "service unavailable")
+			return "", "service_unavailable"
+		default:
+			writeError(writer, http.StatusInternalServerError, "internal_error", "internal server error")
+			return "", "internal_error"
+		}
+	}
+	result.Upload.UploadRequest = nil
+	if result.Transition != "" &&
+		!((result.Transition == "pending_to_finalizing" && result.Upload.State == "finalizing") ||
+			(result.Transition == "pending_to_expired" && result.Upload.State == "expired")) {
+		writeError(writer, http.StatusInternalServerError, "internal_error", "internal server error")
+		return "", "internal_error"
+	}
+
+	status := http.StatusOK
+	if result.Upload.State == "finalizing" {
+		status = http.StatusAccepted
+		writer.Header().Set("Location", "/uploads/"+result.Upload.UploadID)
+	} else if result.Upload.State != "ready" && result.Upload.State != "rejected" && result.Upload.State != "expired" {
+		writeError(writer, http.StatusInternalServerError, "internal_error", "internal server error")
+		return "", "internal_error"
+	}
+
+	if result.Transition != "" {
+		serviceMetrics.Get("upload_transitions_total").(*expvar.Map).Get(result.Transition).(*expvar.Int).Add(1)
+		attributes := []any{
+			"upload_id", result.Upload.UploadID,
+			"state_from", "pending",
+			"state_to", result.Upload.State,
+			"trigger", "completion",
+		}
+		if result.Upload.State == "expired" {
+			attributes = append(attributes, "reason_code", "upload_deadline_elapsed")
+		}
+		a.logger.Info("upload.transition", attributes...)
+	}
+
+	writeJSON(writer, status, result.Upload)
+	return result.Upload.UploadID, ""
 }
 
 func (a *application) serveGetUpload(writer http.ResponseWriter, request *http.Request, uploadID string) (string, string) {
