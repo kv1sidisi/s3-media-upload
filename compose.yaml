@@ -1,0 +1,69 @@
+services:
+  postgres:
+    image: postgres:18.6-bookworm@sha256:1c59e2c3c818eaa0f0628f695b36e7c9e362d6b219b36a54a32df645cbd7e1af
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-media_upload}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-only-not-a-secret}
+      POSTGRES_DB: ${POSTGRES_DB:-media_upload}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-55432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -q -h 127.0.0.1 -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      start_period: 10s
+      interval: 2s
+      timeout: 2s
+      retries: 25
+
+  garage:
+    image: dxflrs/garage:v2.3.0@sha256:866bd13ed2038ba7e7190e840482bc27234c4afaf77be8cfa439ae088c1e4690
+    command: ["/garage", "server", "--single-node", "--default-bucket"]
+    environment:
+      GARAGE_RPC_SECRET: ${GARAGE_RPC_SECRET:-0000000000000000000000000000000000000000000000000000000000000000}
+      GARAGE_DEFAULT_ACCESS_KEY: ${AWS_ACCESS_KEY_ID:-GKLOCALDEMO000000000000}
+      GARAGE_DEFAULT_SECRET_KEY: ${AWS_SECRET_ACCESS_KEY:-1111111111111111111111111111111111111111111111111111111111111111}
+      GARAGE_DEFAULT_BUCKET: ${S3_BUCKET:-media-upload}
+    ports:
+      - "127.0.0.1:${S3_PORT:-3900}:3900"
+    volumes:
+      - ./garage.toml:/etc/garage.toml:ro
+      - garage-meta:/var/lib/garage/meta
+      - garage-data:/var/lib/garage/data
+    healthcheck:
+      test: ["CMD", "/garage", "status"]
+      start_period: 10s
+      interval: 2s
+      timeout: 2s
+      retries: 25
+
+  test:
+    profiles: ["test"]
+    image: golang:1.26.7-bookworm@sha256:e8c859f5632dcfde7b32d2012b4351728f6437930887c2f6a91ea242459e5514
+    working_dir: /workspace
+    network_mode: service:garage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      garage:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://media_upload:local-only-not-a-secret@postgres:5432/media_upload?sslmode=disable
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-GKLOCALDEMO000000000000}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-1111111111111111111111111111111111111111111111111111111111111111}
+      AWS_REGION: garage
+      S3_BUCKET: media-upload
+      S3_ENDPOINT: http://127.0.0.1:3900
+      AWS_IGNORE_CONFIGURED_ENDPOINT_URLS: "true"
+      GOMEMLIMIT: 230MiB
+      CGO_ENABLED: "1"
+      TEST_DATABASE_URL: postgres://media_upload:local-only-not-a-secret@postgres:5432/media_upload?sslmode=disable
+    volumes:
+      - .:/workspace:ro
+    mem_limit: ${TEST_MEMORY_LIMIT:-256m}
+    memswap_limit: ${TEST_MEMORY_LIMIT:-256m}
+
+volumes:
+  postgres-data:
+  garage-meta:
+  garage-data:
