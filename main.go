@@ -12,6 +12,8 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
 const (
@@ -44,11 +46,20 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	presigner := s3.NewPresignClient(storage)
 	app := &application{
 		logger:       logger,
 		postgresPing: pool.Ping,
 		s3HeadBucket: func(ctx context.Context) error {
 			return headBucket(ctx, storage, cfg.S3Bucket)
+		},
+		createUpload: func(ctx context.Context, command createUploadCommand) (createUploadResult, error) {
+			return createOrReplayUpload(ctx, pool, func(ctx context.Context, key, contentType string) (uploadRequest, error) {
+				return presignUploadPUT(ctx, presigner, cfg.S3Bucket, key, contentType)
+			}, command)
+		},
+		getUpload: func(ctx context.Context, uploadID string) (uploadRepresentation, error) {
+			return getUploadByID(ctx, pool, uploadID)
 		},
 	}
 	server := newHTTPServer(cfg.HTTPAddr, app)

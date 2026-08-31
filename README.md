@@ -1,8 +1,9 @@
 # s3-media-upload
 
 `s3-media-upload` is a small Go foundation for a direct-to-S3 media upload service.
-The current slice provides a loopback HTTP process, PostgreSQL schema v1, local Garage
-configuration, health probes, structured logs, and process counters. Upload creation
+The current slice provides a loopback HTTP process, PostgreSQL schema v1, idempotent
+upload creation, 15-minute direct PUT capabilities, authoritative pending reads, local
+Garage configuration, health probes, structured logs, and process counters. Completion
 and file processing are planned but are not implemented yet.
 
 ## Status
@@ -11,6 +12,8 @@ and file processing are planned but are not implemented yet.
 
 - strict loopback-only configuration;
 - forward-only PostgreSQL schema v1;
+- `POST /uploads` with durable idempotency and presigned direct PUT instructions;
+- `GET /uploads/{upload_id}` with an authoritative PostgreSQL representation;
 - `GET /livez`, `GET /readyz`, and `GET /debug/vars`;
 - bounded PostgreSQL and signed S3 readiness checks;
 - JSON logs and a fixed `media_upload_service` expvar subtree;
@@ -18,7 +21,6 @@ and file processing are planned but are not implemented yet.
 
 ### Planned
 
-- idempotent upload creation and presigned direct PUT;
 - durable completion, validation, publication, expiry, and object cleanup.
 
 ### Observed
@@ -29,10 +31,10 @@ On 2026-08-31, the following passed from a local, uncommitted working tree:
 - fresh pinned PostgreSQL 18.6 and Garage 2.3.0 startup plus transactional schema v1 migration;
 - the complete root-package test binary, built under a hard no-swap 2560 MiB limit and
   executed against PostgreSQL and Garage under a hard no-swap 256 MiB limit
-  (`GOMEMLIMIT=230MiB`), with shuffle seed `1788177935590793139` and result `PASS`.
+  (`GOMEMLIMIT=230MiB`), with shuffle seed `1788187538343055235` and result `PASS`.
 
-This is local ticket-01 evidence, not evidence from an immutable revision. No race gate,
-manual upload demo, live AWS run, deployment, or working upload flow has been observed.
+This is local ticket-02 evidence, not evidence from an immutable revision. No race gate,
+manual demo, live AWS run, deployment, or completed/ready upload flow has been observed.
 
 ## Prerequisites
 
@@ -69,6 +71,24 @@ curl --fail-with-body http://127.0.0.1:8080/debug/vars
 `/livez` does not call dependencies. `/readyz` checks PostgreSQL and S3 sequentially
 with a two-second timeout per dependency. `/debug/vars` exposes standard Go expvar data
 and the service subtree without calling dependencies.
+
+Create an upload resource with declarations only:
+
+```sh
+curl --fail-with-body \
+  --request POST http://127.0.0.1:8080/uploads \
+  --header 'Content-Type: application/json' \
+  --header "Idempotency-Key: ${IDEMPOTENCY_KEY:?set to a canonical lowercase UUIDv4}" \
+  --data '{"size_bytes":123456,"content_type":"image/jpeg"}'
+```
+
+The response contains an opaque `upload_request`. Send the image directly to its URL
+with the returned method and complete headers map, without following redirects. Exact
+create replays return the same upload resource and a newly authorized URL while the
+write window is open. A successful storage PUT still leaves the resource `pending`;
+`GET /uploads/{upload_id}` reads that state from PostgreSQL and never returns a storage
+URL, bucket, object key, ETag, digest, claim, or retry metadata. The API never accepts
+or proxies image bytes.
 
 ## Configuration
 
@@ -117,5 +137,5 @@ race gate is reserved for later concurrency slices.
 This service has no authentication, TLS, rate limiting, quota enforcement, or public
 upload controls. Do not expose it to a LAN or the Internet. The bucket must remain
 private, and credentials, DSNs, presigned URLs, request data, and object identifiers
-must not enter logs. This repository does not claim a working upload flow, deployment,
-live AWS verification, broad S3 compatibility, or production readiness.
+must not enter logs. This repository does not claim a completed or ready upload flow,
+deployment, live AWS verification, broad S3 compatibility, or production readiness.
