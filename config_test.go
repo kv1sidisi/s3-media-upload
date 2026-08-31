@@ -41,7 +41,7 @@ func TestConfig(t *testing.T) {
 		{"IPv6 HTTP", "HTTP_ADDR", "[::1]:8080"},
 		{"IPv4 S3", "S3_ENDPOINT", "http://127.0.0.1:3900"},
 		{"IPv6 S3", "S3_ENDPOINT", "http://[::1]:3900"},
-		{"claim lease", "FINALIZE_CLAIM_LEASE", "10.000000001s"},
+		{"claim lease", "FINALIZE_CLAIM_LEASE", "10.000001s"},
 	}
 	for _, test := range valid {
 		t.Run(test.name, func(t *testing.T) {
@@ -75,6 +75,7 @@ func TestConfig(t *testing.T) {
 		{"empty endpoint fragment", "S3_ENDPOINT", "http://127.0.0.1:3900#"},
 		{"endpoint fragment", "S3_ENDPOINT", "http://127.0.0.1:3900#x"},
 		{"short lease", "FINALIZE_CLAIM_LEASE", "10s"},
+		{"sub-microsecond lease margin", "FINALIZE_CLAIM_LEASE", "10.000000999s"},
 		{"invalid lease", "FINALIZE_CLAIM_LEASE", "later"},
 	}
 	for _, test := range invalid {

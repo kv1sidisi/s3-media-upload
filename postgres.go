@@ -184,6 +184,13 @@ func createOrReplayUpload(
 		return createUploadResult{}, errIdempotencyKeyReused
 	}
 	if !uploadAcceptsWrites(existing) {
+		if existing.Upload.State == "ready" || existing.Upload.State == "rejected" || existing.Upload.State == "expired" {
+			representation, err := getUploadByID(ctx, pool, existing.Upload.UploadID)
+			if err != nil {
+				return createUploadResult{}, err
+			}
+			return createUploadResult{Upload: representation}, nil
+		}
 		return createUploadResult{Upload: existing.Upload}, nil
 	}
 
@@ -240,6 +247,13 @@ func authorizeReplay(
 			return createUploadResult{}, errServiceUnavailable
 		}
 		cancelDatabase()
+		if locked.Upload.State == "ready" || locked.Upload.State == "rejected" || locked.Upload.State == "expired" {
+			representation, err := getUploadByID(ctx, pool, locked.Upload.UploadID)
+			if err != nil {
+				return createUploadResult{}, err
+			}
+			return createUploadResult{Upload: representation}, nil
+		}
 		return createUploadResult{Upload: locked.Upload}, nil
 	}
 
@@ -312,6 +326,13 @@ func recoverUnknownUploadCommit(
 			return createUploadResult{}, errServiceUnavailable
 		}
 		current.Upload.UploadRequest = &request
+	}
+	if current.Upload.State == "ready" || current.Upload.State == "rejected" || current.Upload.State == "expired" {
+		representation, err := getUploadByID(ctx, pool, current.Upload.UploadID)
+		if err != nil {
+			return createUploadResult{}, err
+		}
+		current.Upload = representation
 	}
 	return createUploadResult{
 		Upload:  current.Upload,
@@ -442,7 +463,11 @@ func completeUploadAttempt(
 			return completeUploadResult{}, completionRecovery{}, errServiceUnavailable
 		}
 		cancelDatabase()
-		result.Upload = decorateUploadRepresentation(result.Upload)
+		representation, err := getUploadByID(ctx, pool, result.Upload.UploadID)
+		if err != nil {
+			return completeUploadResult{}, completionRecovery{}, err
+		}
+		result.Upload = representation
 		return result, completionRecovery{}, nil
 	default:
 		return completeUploadResult{}, completionRecovery{}, errServiceUnavailable
@@ -474,7 +499,7 @@ func recoverCompletionOutcome(
 		return completeUploadResult{}, errServiceUnavailable
 	}
 	if completionOutcomeIsDurable(current.Upload.State, reconcileAfter, recovery) {
-		return completeUploadResult{Upload: current.Upload}, nil
+		return completionResult(ctx, pool, current)
 	}
 	result, secondRecovery, err := completeUploadAttempt(ctx, pool, uploadID)
 	if !errors.Is(err, errCompletionOutcomeUnknown) {
@@ -487,7 +512,22 @@ func recoverCompletionOutcome(
 	if err != nil || !completionOutcomeIsDurable(current.Upload.State, reconcileAfter, secondRecovery) {
 		return completeUploadResult{}, errServiceUnavailable
 	}
-	return completeUploadResult{Upload: current.Upload}, nil
+	return completionResult(ctx, pool, current)
+}
+
+func completionResult(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	current storedUpload,
+) (completeUploadResult, error) {
+	if current.Upload.State != "ready" && current.Upload.State != "rejected" && current.Upload.State != "expired" {
+		return completeUploadResult{Upload: current.Upload}, nil
+	}
+	representation, err := getUploadByID(ctx, pool, current.Upload.UploadID)
+	if err != nil {
+		return completeUploadResult{}, err
+	}
+	return completeUploadResult{Upload: representation}, nil
 }
 
 func readCompletionUpload(
@@ -538,15 +578,31 @@ func getUploadByID(
 	databaseContext, cancelDatabase := context.WithTimeout(ctx, uploadDatabaseTimeout)
 	defer cancelDatabase()
 	var upload uploadRepresentation
+	var rejectionClass, rejectionReason *string
+	var imageSize *int64
+	var imageContentType *string
+	var imageWidth, imageHeight *int
 	err := pool.QueryRow(databaseContext, `
 		SELECT
-			upload_id::text,
-			state,
-			declared_size,
-			declared_content_type,
-			upload_deadline
-		FROM uploads
-		WHERE upload_id::text = $1`,
+			u.upload_id::text,
+			u.state,
+			u.declared_size,
+			u.declared_content_type,
+			u.upload_deadline,
+			u.rejection_class,
+			u.rejection_reason,
+			c.encoded_size,
+			CASE c.image_format
+				WHEN 'jpeg' THEN 'image/jpeg'
+				WHEN 'png' THEN 'image/png'
+			END,
+			c.width,
+			c.height
+		FROM uploads u
+		LEFT JOIN upload_candidates c
+		  ON c.upload_id = u.upload_id
+		 AND c.object_key = u.final_key
+		WHERE u.upload_id::text = $1`,
 		uploadID,
 	).Scan(
 		&upload.UploadID,
@@ -554,6 +610,12 @@ func getUploadByID(
 		&upload.DeclaredSizeBytes,
 		&upload.DeclaredContentType,
 		&upload.UploadDeadline,
+		&rejectionClass,
+		&rejectionReason,
+		&imageSize,
+		&imageContentType,
+		&imageWidth,
+		&imageHeight,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return uploadRepresentation{}, errUploadNotFound
@@ -562,7 +624,105 @@ func getUploadByID(
 		return uploadRepresentation{}, errServiceUnavailable
 	}
 	upload.UploadDeadline = upload.UploadDeadline.UTC()
+	switch upload.State {
+	case "ready":
+		if imageSize == nil || imageContentType == nil || imageWidth == nil || imageHeight == nil {
+			return uploadRepresentation{}, errServiceUnavailable
+		}
+		upload.Image = &uploadImage{
+			SizeBytes:   *imageSize,
+			ContentType: *imageContentType,
+			Width:       *imageWidth,
+			Height:      *imageHeight,
+		}
+	case "rejected":
+		if rejectionClass == nil || rejectionReason == nil {
+			return uploadRepresentation{}, errServiceUnavailable
+		}
+		failureCode := publicFailureCode(*rejectionClass, *rejectionReason)
+		if failureCode == "" {
+			return uploadRepresentation{}, errServiceUnavailable
+		}
+		upload.Failure = &uploadFailure{Code: failureCode}
+	}
 	return decorateUploadRepresentation(upload), nil
+}
+
+func authorizeContentRead(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	presign func(context.Context, string) (string, time.Time, error),
+	uploadID string,
+) (contentReadResult, error) {
+	databaseContext, cancelDatabase := context.WithTimeout(ctx, uploadDatabaseTimeout)
+	var result contentReadResult
+	var finalKey, rejectionClass, rejectionReason *string
+	err := pool.QueryRow(databaseContext, `
+		SELECT
+			upload_id::text,
+			state,
+			final_key,
+			rejection_class,
+			rejection_reason
+		FROM uploads
+		WHERE upload_id::text = $1`,
+		uploadID,
+	).Scan(
+		&result.UploadID,
+		&result.State,
+		&finalKey,
+		&rejectionClass,
+		&rejectionReason,
+	)
+	cancelDatabase()
+	if errors.Is(err, pgx.ErrNoRows) {
+		return contentReadResult{}, errUploadNotFound
+	}
+	if err != nil {
+		return contentReadResult{}, errServiceUnavailable
+	}
+	switch result.State {
+	case "ready":
+		if finalKey == nil {
+			return contentReadResult{}, errServiceUnavailable
+		}
+		result.URL, result.ExpiresAt, err = presign(ctx, *finalKey)
+		if err != nil {
+			if errors.Is(err, errContentSigningInvalid) {
+				return contentReadResult{}, err
+			}
+			return contentReadResult{}, errServiceUnavailable
+		}
+	case "rejected":
+		if rejectionClass == nil || rejectionReason == nil {
+			return contentReadResult{}, errServiceUnavailable
+		}
+		result.FailureCode = publicFailureCode(*rejectionClass, *rejectionReason)
+		if result.FailureCode == "" {
+			return contentReadResult{}, errServiceUnavailable
+		}
+	case "pending", "finalizing", "expired":
+	default:
+		return contentReadResult{}, errServiceUnavailable
+	}
+	return result, nil
+}
+
+func publicFailureCode(class, reason string) string {
+	switch class {
+	case "invalid_input":
+		switch reason {
+		case "object_too_large", "dimensions_limit_exceeded", "pixel_limit_exceeded":
+			return "image_too_large"
+		case "declared_size_mismatch", "invalid_image_encoding", "declared_content_type_mismatch", "malformed_image":
+			return "invalid_image"
+		}
+	case "internal_invariant":
+		if reason == "decoder_invariant_mismatch" || reason == "candidate_integrity_mismatch" {
+			return "upload_processing_failed"
+		}
+	}
+	return ""
 }
 
 func beginUploadTransaction(

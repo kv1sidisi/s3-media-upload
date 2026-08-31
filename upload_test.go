@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -15,6 +16,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -485,6 +487,10 @@ func TestExactDispatcherAndRepresentation(t *testing.T) {
 			t.Fatalf("completion logs disclosed %q", forbidden)
 		}
 	}
+
+	t.Run("content outcomes", testGetContentOutcomes)
+	t.Run("content route and empty request", testGetContentExactRouteAndEmptyRequest)
+	t.Run("ready image representation", testUploadRepresentationImageIsOptional)
 }
 
 func TestIntegrationCreateIdempotencyAndRecovery(t *testing.T) {
@@ -769,7 +775,7 @@ func TestIntegrationCreateIdempotencyAndRecovery(t *testing.T) {
 	})
 }
 
-func TestIntegrationGarageUploadWireContract(t *testing.T) {
+func TestGarageWireContract(t *testing.T) {
 	if testing.Short() {
 		t.Skip("requires Garage")
 	}
@@ -786,14 +792,19 @@ func TestIntegrationGarageUploadWireContract(t *testing.T) {
 	}
 	presigner := s3.NewPresignClient(storage)
 	key := "staging/" + testUUID(t)
+	candidateBytes := encodeValidationImage(t, "png")
+	candidateDigest := sha256.Sum256(candidateBytes)
+	candidateKey := "media/" + testUUID(t) + "/" + hex.EncodeToString(candidateDigest[:])
 	t.Cleanup(func() {
 		cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cleanupCancel()
-		if _, err := storage.DeleteObject(cleanupContext, &s3.DeleteObjectInput{
-			Bucket: aws.String(cfg.S3Bucket),
-			Key:    aws.String(key),
-		}); err != nil {
-			t.Error("delete Garage object")
+		for _, objectKey := range []string{key, candidateKey} {
+			if _, err := storage.DeleteObject(cleanupContext, &s3.DeleteObjectInput{
+				Bucket: aws.String(cfg.S3Bucket),
+				Key:    aws.String(objectKey),
+			}); err != nil {
+				t.Error("delete Garage object")
+			}
 		}
 	})
 
@@ -859,9 +870,20 @@ func TestIntegrationGarageUploadWireContract(t *testing.T) {
 		t.Fatalf("exact overwrite status=%d", status)
 	}
 	assertGarageObject(t, ctx, storage, cfg.S3Bucket, key, bodyB, "image/png")
+
+	if err := putCandidateObject(ctx, storage, cfg.S3Bucket, candidateKey, candidateBytes, "image/png"); err != nil {
+		t.Fatal("authenticated candidate PUT")
+	}
+	candidateSnapshot, err := captureS3Object(ctx, storage, cfg.S3Bucket, candidateKey, maxUploadSizeBytes)
+	if err != nil || !candidateMatchesSnapshot(trackedCandidate{
+		SHA256:      candidateDigest,
+		EncodedSize: int64(len(candidateBytes)),
+	}, candidateSnapshot) {
+		t.Fatalf("candidate full GET verification failed: %v", err)
+	}
 }
 
-func TestE2EHappyPathAndExactReplay(t *testing.T) {
+func TestE2EHappyPath(t *testing.T) {
 	if testing.Short() {
 		t.Skip("requires migrated PostgreSQL and Garage")
 	}
@@ -895,6 +917,11 @@ func TestE2EHappyPathAndExactReplay(t *testing.T) {
 		getUpload: func(ctx context.Context, uploadID string) (uploadRepresentation, error) {
 			return getUploadByID(ctx, pool, uploadID)
 		},
+		getContent: func(ctx context.Context, uploadID string) (contentReadResult, error) {
+			return authorizeContentRead(ctx, pool, func(ctx context.Context, key string) (string, time.Time, error) {
+				return presignContentGET(ctx, presigner, cfg.S3Bucket, key)
+			}, uploadID)
+		},
 	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -916,11 +943,13 @@ func TestE2EHappyPathAndExactReplay(t *testing.T) {
 	}
 	idempotencyKey := testUUID(t)
 	defer cleanupUploadByIdempotencyKey(t, pool, idempotencyKey)
+	rawBody := encodeValidationImage(t, "png")
+	declaration := `{"size_bytes":` + strconv.Itoa(len(rawBody)) + `,"content_type":"image/png"}`
 	createRequest, err := http.NewRequestWithContext(
 		ctx,
 		http.MethodPost,
 		"http://"+listener.Addr().String()+"/uploads",
-		strings.NewReader(`{"size_bytes":21,"content_type":"image/png"}`),
+		strings.NewReader(declaration),
 	)
 	if err != nil {
 		t.Fatal("build create request")
@@ -951,7 +980,7 @@ func TestE2EHappyPathAndExactReplay(t *testing.T) {
 		t.Fatalf("decode create representation: %v", err)
 	}
 	location := "/uploads/" + created.UploadID
-	if createResponse.Header.Get("Location") != location || created.State != "pending" || created.DeclaredSizeBytes != 21 || created.DeclaredContentType != "image/png" {
+	if createResponse.Header.Get("Location") != location || created.State != "pending" || created.DeclaredSizeBytes != int64(len(rawBody)) || created.DeclaredContentType != "image/png" {
 		t.Fatalf(
 			"create representation mismatch: location_ok=%t state=%q size=%d content_type=%q",
 			createResponse.Header.Get("Location") == location,
@@ -964,7 +993,7 @@ func TestE2EHappyPathAndExactReplay(t *testing.T) {
 		ctx,
 		http.MethodPost,
 		"http://"+listener.Addr().String()+"/uploads",
-		strings.NewReader(`{"size_bytes":21,"content_type":"image/png"}`),
+		strings.NewReader(declaration),
 	)
 	if err != nil {
 		t.Fatal("build exact replay request")
@@ -985,19 +1014,43 @@ func TestE2EHappyPathAndExactReplay(t *testing.T) {
 		json.Unmarshal(replayBody, &replayed) != nil || replayed.UploadID != created.UploadID || replayed.UploadRequest == nil {
 		t.Fatalf("exact replay mismatch: status=%d Location=%q body=%s", replayResponse.StatusCode, replayResponse.Header.Get("Location"), replayBody)
 	}
+	changedRequest, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		"http://"+listener.Addr().String()+"/uploads",
+		strings.NewReader(`{"size_bytes":`+strconv.Itoa(len(rawBody)+1)+`,"content_type":"image/png"}`),
+	)
+	if err != nil {
+		t.Fatal("build changed-fingerprint request")
+	}
+	changedRequest.Header.Set("Idempotency-Key", idempotencyKey)
+	changedRequest.Header.Set("Content-Type", "application/json")
+	changedResponse, err := client.Do(changedRequest)
+	if err != nil {
+		t.Fatal("send changed-fingerprint request")
+	}
+	changedBody, readErr := io.ReadAll(io.LimitReader(changedResponse.Body, 32<<10))
+	changedResponse.Body.Close()
+	if readErr != nil || changedResponse.StatusCode != http.StatusUnprocessableEntity ||
+		responseErrorCode(t, changedBody) != "idempotency_key_reused" {
+		t.Fatalf("changed-fingerprint response: status=%d read_error=%v", changedResponse.StatusCode, readErr)
+	}
 	objectKey := "staging/" + created.UploadID
+	candidateDigest := sha256.Sum256(rawBody)
+	candidateObjectKey := "media/" + created.UploadID + "/" + hex.EncodeToString(candidateDigest[:])
 	t.Cleanup(func() {
 		cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cleanupCancel()
-		if _, err := storage.DeleteObject(cleanupContext, &s3.DeleteObjectInput{
-			Bucket: aws.String(cfg.S3Bucket),
-			Key:    aws.String(objectKey),
-		}); err != nil {
-			t.Error("delete end-to-end object")
+		for _, key := range []string{objectKey, candidateObjectKey} {
+			if _, err := storage.DeleteObject(cleanupContext, &s3.DeleteObjectInput{
+				Bucket: aws.String(cfg.S3Bucket),
+				Key:    aws.String(key),
+			}); err != nil {
+				t.Error("delete end-to-end object")
+			}
 		}
 	})
 
-	rawBody := []byte("direct-put-raw-bytes!")
 	if status := rawPresignedPUT(t, ctx, client, *replayed.UploadRequest, rawBody, ""); status != http.StatusOK {
 		t.Fatalf("direct PUT status=%d", status)
 	}
@@ -1119,6 +1172,64 @@ func TestE2EHappyPathAndExactReplay(t *testing.T) {
 	finalStatus.Body.Close()
 	if readErr != nil || finalStatus.StatusCode != http.StatusOK || !strings.Contains(string(finalStatusBody), `"state":"finalizing"`) {
 		t.Fatalf("finalizing status mismatch: status=%d read_error=%v body=%s", finalStatus.StatusCode, readErr, finalStatusBody)
+	}
+
+	worker := &finalizer{
+		logger:     slog.New(slog.NewJSONHandler(io.Discard, nil)),
+		pool:       pool,
+		storage:    storage,
+		bucket:     cfg.S3Bucket,
+		claimLease: cfg.FinalizeClaimLease,
+	}
+	processed, err := worker.processNext(ctx)
+	if err != nil || !processed {
+		t.Fatalf("finalizer processed=%t error=%v", processed, err)
+	}
+	readyResponse, err := client.Get("http://" + listener.Addr().String() + location)
+	if err != nil {
+		t.Fatal("GET ready upload")
+	}
+	readyBody, readErr := io.ReadAll(io.LimitReader(readyResponse.Body, 32<<10))
+	readyResponse.Body.Close()
+	var ready uploadRepresentation
+	if readErr != nil || readyResponse.StatusCode != http.StatusOK ||
+		readyResponse.Header.Get("Content-Type") != "application/json" ||
+		readyResponse.Header.Get("Cache-Control") != "no-store" || json.Unmarshal(readyBody, &ready) != nil ||
+		ready.State != "ready" || ready.UploadRequest != nil || ready.Failure != nil || ready.Image == nil ||
+		ready.Image.SizeBytes != int64(len(rawBody)) || ready.Image.ContentType != "image/png" ||
+		ready.Image.Width != 2 || ready.Image.Height != 3 {
+		t.Fatalf("ready response mismatch: status=%d read_error=%v", readyResponse.StatusCode, readErr)
+	}
+	for _, forbidden := range []string{"url", "bucket", "staging", "etag", "sha256", "claim", "retry", "X-Amz-"} {
+		if strings.Contains(strings.ToLower(string(readyBody)), strings.ToLower(forbidden)) {
+			t.Fatalf("ready representation disclosed %q", forbidden)
+		}
+	}
+
+	contentResponse, err := client.Get("http://" + listener.Addr().String() + location + "/content")
+	if err != nil {
+		t.Fatal("GET content redirect")
+	}
+	contentBody, readErr := io.ReadAll(io.LimitReader(contentResponse.Body, 1))
+	contentResponse.Body.Close()
+	contentLocation := contentResponse.Header.Get("Location")
+	if readErr != nil || contentResponse.StatusCode != http.StatusTemporaryRedirect || len(contentBody) != 0 ||
+		contentLocation == "" || contentResponse.Header.Get("Cache-Control") != "private, no-store" ||
+		contentResponse.Header.Get("X-Content-Type-Options") != "nosniff" {
+		t.Fatalf("content redirect mismatch: status=%d empty=%t location_present=%t", contentResponse.StatusCode, len(contentBody) == 0, contentLocation != "")
+	}
+	downloadRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, contentLocation, nil)
+	if err != nil {
+		t.Fatal("build ready content download")
+	}
+	downloadResponse, err := (&http.Client{Timeout: 10 * time.Second}).Do(downloadRequest)
+	if err != nil {
+		t.Fatal("download ready content")
+	}
+	downloaded, readErr := io.ReadAll(io.LimitReader(downloadResponse.Body, maxUploadSizeBytes+1))
+	downloadResponse.Body.Close()
+	if readErr != nil || downloadResponse.StatusCode != http.StatusOK || !bytes.Equal(downloaded, rawBody) {
+		t.Fatalf("ready content mismatch: status=%d read_error=%v bytes_equal=%t", downloadResponse.StatusCode, readErr, bytes.Equal(downloaded, rawBody))
 	}
 }
 
@@ -1324,6 +1435,27 @@ func cleanupUploadByIdempotencyKey(t *testing.T, pool *pgxpool.Pool, idempotency
 			WHERE idempotency_key = $1::uuid
 		)`, idempotencyKey); err != nil {
 		t.Error("delete test upload tombstones")
+		return
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE uploads
+		SET state = 'finalizing',
+		    reconcile_after = clock_timestamp(),
+		    terminal_at = NULL,
+		    final_key = NULL
+		WHERE idempotency_key = $1::uuid
+		  AND state = 'ready'`, idempotencyKey); err != nil {
+		t.Error("detach selected test candidate")
+		return
+	}
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM upload_candidates
+		WHERE upload_id IN (
+			SELECT upload_id
+			FROM uploads
+			WHERE idempotency_key = $1::uuid
+		)`, idempotencyKey); err != nil {
+		t.Error("delete test upload candidates")
 		return
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM uploads WHERE idempotency_key = $1::uuid`, idempotencyKey); err != nil {

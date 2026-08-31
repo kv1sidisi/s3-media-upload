@@ -4,8 +4,8 @@
 The current slice provides a loopback HTTP process, PostgreSQL schema v1, idempotent
 upload creation, 15-minute direct PUT capabilities, authoritative pending reads, local
 Garage configuration, durable asynchronous completion intent, authoritative status
-reads, health probes, structured logs, and process counters. File processing is planned
-but is not implemented yet.
+reads, verified JPEG/PNG publication, ready-only direct content reads, health probes,
+structured logs, and process counters.
 
 ## Status
 
@@ -15,6 +15,9 @@ but is not implemented yet.
 - forward-only PostgreSQL schema v1;
 - `POST /uploads` with durable idempotency and presigned direct PUT instructions;
 - `POST /uploads/{upload_id}/complete` with restart-safe `finalizing` intent;
+- a sequential fenced finalizer with bounded validation, candidate publication, and
+  full-GET verification;
+- immutable `ready`/`rejected` outcomes and `GET /uploads/{upload_id}/content`;
 - `GET /uploads/{upload_id}` with an authoritative PostgreSQL representation;
 - `GET /livez`, `GET /readyz`, and `GET /debug/vars`;
 - bounded PostgreSQL and signed S3 readiness checks;
@@ -23,7 +26,7 @@ but is not implemented yet.
 
 ### Planned
 
-- validation, publication, time-driven expiry, and object cleanup.
+- time-driven missing expiry and physical object cleanup.
 
 ### Observed
 
@@ -33,12 +36,12 @@ On 2026-08-31, the following passed from a local, uncommitted working tree:
 - healthy pinned PostgreSQL 18.6 and Garage 2.3.0 with schema v1 present;
 - the complete root-package test binary, built under a hard no-swap 2560 MiB limit and
   executed against PostgreSQL and Garage under a hard no-swap 256 MiB limit
-  (`GOMEMLIMIT=230MiB`), with shuffle seed `1788195547231866079` and result `PASS`;
+  (`GOMEMLIMIT=230MiB`), with shuffle seed `1788200551998977133` and result `PASS`;
 - the complete race suite under a hard no-swap 2560 MiB limit, with zero race reports
-  and result `ok` in 4.731 seconds.
+  and result `ok` in 17.811 seconds.
 
-This is local ticket-03 evidence, not evidence from an immutable revision. A manual
-demo, live AWS, deployment, and a validated ready upload flow have not been observed.
+This is local ticket-04 working-tree evidence, not evidence for an immutable revision.
+A manual demo, live AWS, and deployment have not been observed.
 
 ## Prerequisites
 
@@ -102,13 +105,20 @@ curl --fail-with-body \
 ```
 
 A timely request returns `202` and `finalizing`; an exact replay also returns `202` and
-wakes future recovery without changing the original completion time. Completion does
-not inspect S3, validate bytes, or mean that media is ready. A request at or after the
-upload deadline atomically expires the upload and records staging cleanup work.
+wakes recovery without changing the original completion time. The completion handler
+does not inspect S3 or validate bytes. The sequential finalizer later captures one
+bounded staging snapshot, validates it, tracks a content-addressed candidate before
+writing, and performs a full length-and-SHA-256 GET verification before committing
+`ready`. Invalid input becomes an immutable safe `rejected` outcome. A request at or
+after the upload deadline atomically expires the upload and records staging cleanup
+work. Claims are fenced leases, not exactly-once execution: after a crash or ambiguous
+PUT, a fresh worker verifies every tracked candidate before reading staging again.
 
 `GET /uploads/{upload_id}` reads the current state from PostgreSQL and never returns a
 storage URL, bucket, object key, ETag, digest, completion timestamp, claim, or retry
-metadata. The API never accepts or proxies image bytes.
+metadata. Ready representations contain only decoder-derived image metadata.
+`GET /uploads/{upload_id}/content` returns a five-minute `307` capability only for
+`ready`; the API never accepts or proxies image bytes.
 
 ## Configuration
 
@@ -119,7 +129,7 @@ metadata. The API never accepts or proxies image bytes.
 | `S3_BUCKET` | Yes | Dedicated private bucket name. |
 | `AWS_REGION` | Yes | AWS signing region. |
 | `S3_ENDPOINT` | No | Origin-only loopback HTTP URL for local Garage. |
-| `FINALIZE_CLAIM_LEASE` | No | Defaults to `30s` and must exceed the fixed 10-second S3 deadline. |
+| `FINALIZE_CLAIM_LEASE` | No | Defaults to `30s`; minimum `10.000001s` so it exceeds the fixed 10-second S3 deadline at PostgreSQL precision. |
 
 AWS credentials use the standard AWS SDK chain. `.env.example` contains disposable
 local values only; `.env` is ignored.
@@ -134,17 +144,22 @@ test -z "$(gofmt -l *.go)"
 GOTOOLCHAIN=local go vet ./...
 GOTOOLCHAIN=local go test -short -count=1 -shuffle=on -timeout=30s ./...
 
-mkdir .ticket01-bin
+mkdir .test-bin
 TEST_MEMORY_LIMIT=2560m docker compose run --rm -T \
-  --volume "$PWD/.ticket01-bin:/out" \
+  --volume "$PWD/.test-bin:/out" \
   --env GOMEMLIMIT=2GiB \
   test sh -ec 'GOTOOLCHAIN=local go test -c -o /out/service.test .'
 TEST_MEMORY_LIMIT=256m docker compose run --rm -T \
-  --volume "$PWD/.ticket01-bin:/out:ro" \
+  --volume "$PWD/.test-bin:/out:ro" \
   --env GOMEMLIMIT=230MiB \
   test sh -ec '/out/service.test -test.count=1 -test.shuffle=on -test.timeout=3m'
-rm -f .ticket01-bin/service.test
-rmdir .ticket01-bin
+rm -f .test-bin/service.test
+rmdir .test-bin
+
+TEST_MEMORY_LIMIT=2560m docker compose run --rm -T \
+  --env GOMEMLIMIT=2GiB \
+  test sh -ec \
+  'GOTOOLCHAIN=local go test -race -count=1 -shuffle=on -timeout=10m ./...'
 ```
 
 Cold compilation did not fit the 256 MiB execution envelope, including serialized and
@@ -157,6 +172,6 @@ race suite executes separately under the 2560 MiB envelope.
 This service has no authentication, TLS, rate limiting, quota enforcement, or public
 upload controls. Do not expose it to a LAN or the Internet. The bucket must remain
 private, and credentials, DSNs, presigned URLs, request data, and object identifiers
-must not enter logs. This repository does not claim validated publication, a ready
-upload flow, deployment, live AWS verification, broad S3 compatibility, or production
-readiness.
+must not enter logs. This repository does not claim deployment, live AWS verification,
+broad S3 compatibility, or production readiness. Time-driven missing expiry and
+physical tombstone deletion remain separate planned slices.

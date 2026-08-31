@@ -13,7 +13,7 @@ type completeCallOutcome struct {
 	err    error
 }
 
-func TestParentFirstCandidateTerminalRace(t *testing.T) {
+func TestParentFirstCompletionExpiryRace(t *testing.T) {
 	if testing.Short() {
 		t.Skip("requires migrated PostgreSQL")
 	}
@@ -229,7 +229,7 @@ func TestParentFirstCandidateTerminalRace(t *testing.T) {
 	}
 }
 
-func TestDurableBoundaryRecovery(t *testing.T) {
+func TestCompletionDurableBoundaryRecovery(t *testing.T) {
 	if testing.Short() {
 		t.Skip("requires migrated PostgreSQL")
 	}

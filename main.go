@@ -64,12 +64,34 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		getUpload: func(ctx context.Context, uploadID string) (uploadRepresentation, error) {
 			return getUploadByID(ctx, pool, uploadID)
 		},
+		getContent: func(ctx context.Context, uploadID string) (contentReadResult, error) {
+			return authorizeContentRead(ctx, pool, func(ctx context.Context, key string) (string, time.Time, error) {
+				return presignContentGET(ctx, presigner, cfg.S3Bucket, key)
+			}, uploadID)
+		},
 	}
 	server := newHTTPServer(cfg.HTTPAddr, app)
 	listener, err := net.Listen("tcp", cfg.HTTPAddr)
 	if err != nil {
 		return errors.New("http listener creation failed")
 	}
+	workerContext, stopWorkers := context.WithCancel(ctx)
+	workerDone := make(chan struct{})
+	go func() {
+		runFinalizer(
+			workerContext,
+			logger,
+			pool,
+			storage,
+			cfg.S3Bucket,
+			cfg.FinalizeClaimLease,
+		)
+		close(workerDone)
+	}()
+	defer func() {
+		stopWorkers()
+		<-workerDone
+	}()
 	serveResult := make(chan error, 1)
 	go func() {
 		serveResult <- server.Serve(listener)

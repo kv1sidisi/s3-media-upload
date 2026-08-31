@@ -64,7 +64,7 @@ func loadConfigFrom(getenv func(string) string) (config, error) {
 		}
 		cfg.FinalizeClaimLease = lease
 	}
-	if cfg.FinalizeClaimLease <= s3OperationTimeout {
+	if cfg.FinalizeClaimLease < s3OperationTimeout+time.Microsecond {
 		return config{}, errors.New("claim lease does not exceed the S3 operation timeout")
 	}
 	return cfg, nil

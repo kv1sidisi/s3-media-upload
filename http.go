@@ -35,6 +35,7 @@ type application struct {
 	createUpload   func(context.Context, createUploadCommand) (createUploadResult, error)
 	completeUpload func(context.Context, string) (completeUploadResult, error)
 	getUpload      func(context.Context, string) (uploadRepresentation, error)
+	getContent     func(context.Context, string) (contentReadResult, error)
 	stopping       atomic.Bool
 }
 
@@ -59,10 +60,26 @@ type uploadRepresentation struct {
 	UploadDeadline      time.Time      `json:"upload_deadline"`
 	UploadRequest       *uploadRequest `json:"upload_request,omitempty"`
 	Failure             *uploadFailure `json:"failure,omitempty"`
+	Image               *uploadImage   `json:"image,omitempty"`
 }
 
 type uploadFailure struct {
 	Code string `json:"code"`
+}
+
+type uploadImage struct {
+	SizeBytes   int64  `json:"size_bytes"`
+	ContentType string `json:"content_type"`
+	Width       int    `json:"width"`
+	Height      int    `json:"height"`
+}
+
+type contentReadResult struct {
+	UploadID    string
+	State       string
+	FailureCode string
+	URL         string
+	ExpiresAt   time.Time
 }
 
 type createUploadResult struct {
@@ -132,6 +149,8 @@ func (a *application) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 		loggedUploadID, errorCode = a.serveCreateUpload(recorder, request)
 	case route == "/uploads/{upload_id}/complete":
 		loggedUploadID, errorCode = a.serveCompleteUpload(recorder, request, uploadID)
+	case route == "/uploads/{upload_id}/content":
+		loggedUploadID, errorCode = a.serveGetContent(recorder, request, uploadID)
 	case route == "/uploads/{upload_id}":
 		loggedUploadID, errorCode = a.serveGetUpload(recorder, request, uploadID)
 	}
@@ -166,6 +185,13 @@ func applicationRoute(path string) (string, string) {
 	const prefix = "/uploads/"
 	if strings.HasPrefix(path, prefix) {
 		uploadID := strings.TrimPrefix(path, prefix)
+		if strings.HasSuffix(uploadID, "/content") {
+			uploadID = strings.TrimSuffix(uploadID, "/content")
+			if uploadID != "" && !strings.Contains(uploadID, "/") {
+				return "/uploads/{upload_id}/content", uploadID
+			}
+			return "", ""
+		}
 		if strings.HasSuffix(uploadID, "/complete") {
 			uploadID = strings.TrimSuffix(uploadID, "/complete")
 			if uploadID != "" && !strings.Contains(uploadID, "/") {
@@ -396,6 +422,73 @@ func (a *application) serveGetUpload(writer http.ResponseWriter, request *http.R
 	upload.UploadRequest = nil
 	writeJSON(writer, http.StatusOK, upload)
 	return upload.UploadID, ""
+}
+
+func (a *application) serveGetContent(writer http.ResponseWriter, request *http.Request, uploadID string) (string, string) {
+	body := http.MaxBytesReader(writer, request.Body, 0)
+	_, err := io.ReadAll(body)
+	_ = body.Close()
+	if err != nil {
+		writeError(writer, http.StatusBadRequest, "invalid_request", "request body must be empty")
+		return "", "invalid_request"
+	}
+
+	result, err := a.getContent(request.Context(), uploadID)
+	if err != nil {
+		switch {
+		case errors.Is(err, errUploadNotFound):
+			writeError(writer, http.StatusNotFound, "upload_not_found", "upload not found")
+			return "", "upload_not_found"
+		case errors.Is(err, errServiceUnavailable):
+			writeError(writer, http.StatusServiceUnavailable, "service_unavailable", "service unavailable")
+			return "", "service_unavailable"
+		default:
+			writeError(writer, http.StatusInternalServerError, "internal_error", "internal server error")
+			return "", "internal_error"
+		}
+	}
+
+	switch result.State {
+	case "ready":
+		if result.URL == "" {
+			writeError(writer, http.StatusInternalServerError, "internal_error", "internal server error")
+			return result.UploadID, "internal_error"
+		}
+		writer.Header().Set("Location", result.URL)
+		writer.Header().Set("Cache-Control", "private, no-store")
+		writer.Header().Set("X-Content-Type-Options", "nosniff")
+		writer.WriteHeader(http.StatusTemporaryRedirect)
+		a.logger.Info(
+			"capability.issued",
+			"upload_id", result.UploadID,
+			"kind", "content_get",
+			"source", "ready_read",
+			"expires_at", result.ExpiresAt,
+		)
+		return result.UploadID, ""
+	case "pending", "finalizing":
+		writeError(writer, http.StatusConflict, "upload_not_ready", "upload is not ready")
+		return result.UploadID, "upload_not_ready"
+	case "rejected":
+		switch result.FailureCode {
+		case "image_too_large":
+			writeError(writer, http.StatusUnprocessableEntity, result.FailureCode, "image is too large")
+		case "invalid_image":
+			writeError(writer, http.StatusUnprocessableEntity, result.FailureCode, "invalid image")
+		case "upload_processing_failed":
+			writeError(writer, http.StatusInternalServerError, result.FailureCode, "upload processing failed")
+		default:
+			writeError(writer, http.StatusInternalServerError, "internal_error", "internal server error")
+			return result.UploadID, "internal_error"
+		}
+		return result.UploadID, result.FailureCode
+	case "expired":
+		writeError(writer, http.StatusGone, "upload_expired", "upload expired")
+		return result.UploadID, "upload_expired"
+	default:
+		writeError(writer, http.StatusInternalServerError, "internal_error", "internal server error")
+		return result.UploadID, "internal_error"
+	}
 }
 
 func operationalRoute(path string) string {
