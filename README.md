@@ -12,9 +12,9 @@ upload service or a production deployment.
 
 | Label | Current truth |
 | --- | --- |
-| Implemented | The current working tree contains the complete local service, canonical `U1-U5`, `P1-P6`, `S1`, and `E1-E6` tests, Compose environment, and CI workflow. The working tree is not an immutable revision. |
-| Planned | Create a clean immutable revision, run the exact full and race gates, then run the live demo on that same revision. Commit, push, remote CI, deployment, and live AWS are separate operations. |
-| Observed | No ticket-07 full/race/demo evidence has been recorded on one clean immutable revision. The historical local working-tree observations below do not satisfy that claim. |
+| Implemented | Clean revision `6fdc8b7a051144639ff78390c80bb62fe8132131` contains the complete local service, canonical `U1-U5`, `P1-P6`, `S1`, and `E1-E6` tests, Compose environment, and CI workflow. |
+| Planned | Push, remote CI, deployment, and live AWS remain separate operations. |
+| Observed | On 2026-09-01, the exact local quick/full/race gates and a one-second loopback demo passed against clean revision `6fdc8b7a051144639ff78390c80bb62fe8132131`; the bounded claim is recorded below. |
 
 ## Data flow
 
@@ -221,16 +221,20 @@ deletes Compose volumes only on its ephemeral runner.
 
 ## Evidence
 
-| Evidence | Revision | Environment | Result | Claim |
-| --- | --- | --- | --- | --- |
-| Historical local gates, 2026-08-31 | Uncommitted working tree; not immutable | Go 1.26.7, PostgreSQL 18.6, Garage 2.3.0; full build 2560 MiB, full execution 256 MiB, race 2560 MiB | Format, vet, quick, full, and race passed; full seed `1788200551998977133`; race completed without a report in 17.811 seconds | Diagnostic working-tree evidence only. It does not satisfy ticket-07 clean-revision evidence. |
-| Ticket-07 full/race/demo | None | Not run | No result recorded | No `Observed` clean-revision claim. |
+The demo result was recorded at `2026-09-01T10:10:20Z` on clean revision
+`6fdc8b7a051144639ff78390c80bb62fe8132131`; the tree was clean before and after the
+combined quick/full/race batch and again after demo shutdown, log audit, and cleanup.
+The local runner was macOS `26.4.1` on `arm64`, with Go `1.26.7`, Docker client
+`29.6.1`, Docker server `29.5.2`, and Docker Compose `5.1.2`. PostgreSQL was `18.6`;
+Garage was `2.3.0` in `consistent` mode; the migration ledger was `1|1`. Compose used
+the pinned PostgreSQL, Garage, and
+`golang:1.26.7-bookworm@sha256:e8c859f5632dcfde7b32d2012b4351728f6437930887c2f6a91ea242459e5514`
+image digests listed above.
 
-A future qualifying record must use one full immutable revision and include the clean
-tree fact, UTC date, runner/OS/architecture, actual tool versions and image digests,
-Garage mode, migration ledger, memory envelope, exact command/input, duration/result,
-skip/timeout/race facts, safe event/counter deltas, and demo image path, SHA-256, size,
-MIME type, dimensions, and idempotency key.
+| Evidence | Command or exact input | Result | Supported claim |
+| --- | --- | --- | --- |
+| Quick/full/race | The verification commands above, unchanged. Full used a 2560 MiB build with `GOMEMLIMIT=2GiB`, then a 256 MiB execution with `GOMEMLIMIT=230MiB`; race used 2560 MiB. | Quick: `ok` in `0.997s`. Full: `PASS`, seed `1788256824094762465`, 31 seconds including cold build. Race: `ok` in `18.203s`, 54 seconds including cold race build. Non-short PostgreSQL/Garage tests ran without skip, timeout, hang, or race report; the suite contains `TestParentFirstCandidateTerminalRace` and `TestE2EFinalizeRecovery/delegate_then_fail`. | The canonical local quick/full/race suite passed under the recorded version and memory boundaries. |
+| Live demo | A sanitized non-interactive execution of the documented endpoint sequence used status-only `curl` calls and in-memory `plutil` parsing with `/tmp/media-upload-ticket07.png`, SHA-256 `431ced6916a2a21a156e38701afe55bbd7f88969fbbfc56d7fe099d47f265460`, 68 bytes, `image/png`, `1x1`, and idempotency key `9e7763d1-3cd6-4ee5-a7f9-0701f6a09eaa`. Opaque capabilities were parsed only in shell memory and never printed or stored. | `/livez=200`, `/readyz=200`, create `201`, exact replay `200` with the same upload ID, direct PUT `200`, completion `202`, terminal `ready`, content `307`, download `200`, and `cmp=0` in one second. Status exposed decoder-derived `68,image/png,1x1` and no capability. Transition deltas were `1,1,1`; exact safe log counts were `service.started=1`, `service.stopping=1`, `service.stopped=1`, `capability.issued=4`, `upload.transition=3`, `finalize.phase=16`, and `http.request_finished=12`. The log regex audit found no `put_succeeded`, `X-Amz-`, `location`, `authorization`, `object_key`, `bucket`, `sha256`, `idempotency_key`, `claim_token`, or `reservation_token`. | One loopback Garage flow on the recorded revision reached verified `ready` and returned exact bytes; this is not an AWS, production, performance, or arbitrary-failure claim. |
 
 Never store presigned URLs, redirect `Location`, credentials, DSNs or environment
 dumps, raw headers or bodies, image bytes, bucket/object keys, provider errors, or
