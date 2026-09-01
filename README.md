@@ -5,7 +5,7 @@ The current slice provides a loopback HTTP process, PostgreSQL schema v1, idempo
 upload creation, 15-minute direct PUT capabilities, authoritative pending reads, local
 Garage configuration, durable asynchronous completion intent, authoritative status
 reads, verified JPEG/PNG publication, ready-only direct content reads, health probes,
-structured logs, and process counters.
+structured logs, process counters, and permanent tombstone cleanup.
 
 ## Status
 
@@ -19,15 +19,13 @@ structured logs, and process counters.
   full-GET verification;
 - time-driven abandoned and confirmed-missing expiry with durable cleanup duties;
 - immutable `ready`/`rejected` outcomes and `GET /uploads/{upload_id}/content`;
+- DB-driven at-least-once cleanup of staging and unselected candidate objects;
 - `GET /uploads/{upload_id}` with an authoritative PostgreSQL representation;
 - `GET /livez`, `GET /readyz`, and `GET /debug/vars`;
 - bounded PostgreSQL and signed S3 readiness checks;
 - JSON logs and a fixed `media_upload_service` expvar subtree;
+- coordinated HTTP, finalizer, and maintenance shutdown;
 - pinned local PostgreSQL, Garage, and Go test containers.
-
-### Planned
-
-- physical object cleanup.
 
 ### Observed
 
@@ -124,6 +122,20 @@ metadata. Ready representations contain only decoder-derived image metadata.
 `GET /uploads/{upload_id}/content` returns a five-minute `307` capability only for
 `ready`; the API never accepts or proxies image bytes.
 
+Terminal decisions commit permanent cleanup tombstones for staging and unselected
+candidate keys. The single maintenance loop reserves up to ten due tombstones, commits
+the reservation before a bounded `DeleteObject`, and applies the result only through the
+exact reservation token. Transient and ambiguous failures back off from one minute to
+one hour; deterministic failures retry hourly. Success or confirmed absence schedules
+another protective sweep after 24 hours, so a late in-flight PUT still converges. The
+selected `final_key` never receives a tombstone. Cleanup is idempotent and at least once,
+not exactly once.
+
+`/debug/vars` exposes cleanup attempts, durable outcomes, retries, due count, oldest due
+age, and snapshot time under `media_upload_service`. `SIGINT` or `SIGTERM` cancels worker
+S3 calls, drains active HTTP requests with an independent ten-second budget, waits for
+both workers, and closes PostgreSQL last.
+
 ## Configuration
 
 | Variable | Required | Contract |
@@ -177,5 +189,5 @@ This service has no authentication, TLS, rate limiting, quota enforcement, or pu
 upload controls. Do not expose it to a LAN or the Internet. The bucket must remain
 private, and credentials, DSNs, presigned URLs, request data, and object identifiers
 must not enter logs. This repository does not claim deployment, live AWS verification,
-broad S3 compatibility, or production readiness. Physical tombstone deletion remains
-a separate planned slice.
+broad S3 compatibility, or production readiness. Permanent tombstones bound physical
+orphan storage but are never garbage-collected from PostgreSQL.

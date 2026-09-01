@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -76,8 +77,10 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		return errors.New("http listener creation failed")
 	}
 	workerContext, stopWorkers := context.WithCancel(ctx)
-	workerDone := make(chan struct{}, 2)
+	var workers sync.WaitGroup
+	workers.Add(2)
 	go func() {
+		defer workers.Done()
 		runFinalizer(
 			workerContext,
 			logger,
@@ -86,16 +89,14 @@ func run(ctx context.Context, logger *slog.Logger) error {
 			cfg.S3Bucket,
 			cfg.FinalizeClaimLease,
 		)
-		workerDone <- struct{}{}
 	}()
 	go func() {
-		runExpiry(workerContext, logger, pool)
-		workerDone <- struct{}{}
+		defer workers.Done()
+		runMaintenance(workerContext, logger, pool, storage, cfg.S3Bucket)
 	}()
 	defer func() {
 		stopWorkers()
-		<-workerDone
-		<-workerDone
+		workers.Wait()
 	}()
 	serveResult := make(chan error, 1)
 	go func() {
@@ -120,14 +121,19 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		"shutdown_reason", "context_canceled",
 		"duration_ms", int64(0),
 	)
+	stopWorkers()
 	shutdownContext, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
-	if err := server.Shutdown(shutdownContext); err != nil {
+	shutdownErr := server.Shutdown(shutdownContext)
+	if shutdownErr != nil {
 		_ = server.Close()
-		<-serveResult
+	}
+	serveErr := <-serveResult
+	workers.Wait()
+	if shutdownErr != nil {
 		return errors.New("http server shutdown failed")
 	}
-	if err := <-serveResult; err != nil && !errors.Is(err, http.ErrServerClosed) {
+	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
 		return errors.New("http server stopped unexpectedly")
 	}
 	logger.Info(

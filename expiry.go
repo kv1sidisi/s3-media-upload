@@ -12,23 +12,17 @@ import (
 )
 
 const (
-	expiryBatchSize     = 100
-	expirySweepInterval = time.Minute
+	expiryBatchSize          = 100
+	maintenanceSweepInterval = time.Minute
 )
 
-func runExpiry(ctx context.Context, logger *slog.Logger, pool *pgxpool.Pool) {
-	runExpiryLoop(ctx, func(ctx context.Context) {
-		sweepPendingExpiries(ctx, logger, pool)
-	})
-}
-
-func runExpiryLoop(ctx context.Context, sweep func(context.Context)) {
+func runMaintenanceLoop(ctx context.Context, sweep func(context.Context)) {
 	for ctx.Err() == nil {
 		sweep(ctx)
 		if ctx.Err() != nil {
 			return
 		}
-		timer := time.NewTimer(expirySweepInterval)
+		timer := time.NewTimer(maintenanceSweepInterval)
 		select {
 		case <-ctx.Done():
 			if !timer.Stop() {

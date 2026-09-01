@@ -52,6 +52,30 @@ func TestConfigAndRetryPolicy(t *testing.T) {
 			}
 		})
 	}
+	for _, test := range []struct {
+		name       string
+		streak     int
+		errorClass string
+		want       time.Duration
+	}{
+		{"first cleanup transient", 1, "transient", time.Minute},
+		{"second cleanup ambiguous", 2, "ambiguous", 2 * time.Minute},
+		{"sixth cleanup transient", 6, "transient", 32 * time.Minute},
+		{"cleanup cap", 7, "ambiguous", time.Hour},
+		{"cleanup auth cadence", 1, "auth", time.Hour},
+		{"cleanup configuration cadence", 4, "configuration", time.Hour},
+		{"cleanup deterministic cadence", 2, "other_deterministic", time.Hour},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := cleanupRetryDelay(test.streak, test.errorClass); got != test.want {
+				t.Fatalf("cleanup delay=%s, want %s", got, test.want)
+			}
+		})
+	}
+	if cleanupBatchSize != 10 || cleanupReservationLease != 30*time.Second ||
+		cleanupProtectiveInterval != 24*time.Hour || s3OperationTimeout != 10*time.Second {
+		t.Fatal("cleanup fixed policy changed")
+	}
 	if classifyStorageError(errObjectLengthMismatch, false) != "transient" ||
 		classifyStorageError(context.DeadlineExceeded, false) != "transient" ||
 		classifyStorageError(context.DeadlineExceeded, true) != "ambiguous" {
@@ -102,8 +126,8 @@ func TestWorkerSchedulingAndCancellation(t *testing.T) {
 	if finalizerIdleWait != time.Second {
 		t.Fatalf("finalizer idle wait=%s, want 1s", finalizerIdleWait)
 	}
-	if expirySweepInterval != time.Minute {
-		t.Fatalf("expiry sweep interval=%s, want 1m", expirySweepInterval)
+	if maintenanceSweepInterval != time.Minute {
+		t.Fatalf("maintenance sweep interval=%s, want 1m", maintenanceSweepInterval)
 	}
 	t.Run("finalizer idle", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
@@ -141,7 +165,7 @@ func TestWorkerSchedulingAndCancellation(t *testing.T) {
 			}
 		})
 	})
-	t.Run("expiry immediate and non-overlapping", func(t *testing.T) {
+	t.Run("maintenance immediate and non-overlapping", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(t.Context())
 			calls := make(chan time.Time, 3)
@@ -149,7 +173,7 @@ func TestWorkerSchedulingAndCancellation(t *testing.T) {
 			done := make(chan struct{})
 			go func() {
 				defer close(done)
-				runExpiryLoop(ctx, func(context.Context) {
+				runMaintenanceLoop(ctx, func(context.Context) {
 					calls <- time.Now()
 					<-release
 				})
@@ -157,14 +181,14 @@ func TestWorkerSchedulingAndCancellation(t *testing.T) {
 
 			synctest.Wait()
 			first := <-calls
-			time.Sleep(2 * expirySweepInterval)
+			time.Sleep(2 * maintenanceSweepInterval)
 			synctest.Wait()
 			if len(calls) != 0 {
 				t.Fatal("expiry sweep overlapped a blocked pass")
 			}
 			release <- struct{}{}
 			synctest.Wait()
-			time.Sleep(expirySweepInterval - time.Nanosecond)
+			time.Sleep(maintenanceSweepInterval - time.Nanosecond)
 			synctest.Wait()
 			if len(calls) != 0 {
 				t.Fatal("expiry sweep restarted before the post-pass interval")
@@ -172,8 +196,8 @@ func TestWorkerSchedulingAndCancellation(t *testing.T) {
 			time.Sleep(time.Nanosecond)
 			synctest.Wait()
 			second := <-calls
-			if second.Sub(first) != 3*expirySweepInterval {
-				t.Fatalf("expiry sweep start interval=%s, want %s", second.Sub(first), 3*expirySweepInterval)
+			if second.Sub(first) != 3*maintenanceSweepInterval {
+				t.Fatalf("maintenance sweep start interval=%s, want %s", second.Sub(first), 3*maintenanceSweepInterval)
 			}
 
 			release <- struct{}{}
@@ -182,7 +206,7 @@ func TestWorkerSchedulingAndCancellation(t *testing.T) {
 			select {
 			case <-done:
 			default:
-				t.Fatal("canceled expiry loop did not stop")
+				t.Fatal("canceled maintenance loop did not stop")
 			}
 		})
 	})
@@ -294,6 +318,7 @@ func TestDueQueueAndTokenFencing(t *testing.T) {
 		t.Fatal("stale actor changed the fresh claim")
 	}
 	t.Run("pending expiry queue and batch", testPendingExpiryQueueAndBatch)
+	t.Run("cleanup queue and fencing", testCleanupDueQueueAndTokenFencing)
 }
 
 func TestDurableBoundaryRecovery(t *testing.T) {
@@ -439,6 +464,7 @@ func TestDurableBoundaryRecovery(t *testing.T) {
 		t.Fatalf("stale retry applied=%t error=%v", staleApplied, err)
 	}
 	t.Run("expiry durable boundaries", testExpiryDurableBoundaryRecovery)
+	t.Run("cleanup durable boundaries", testCleanupDurableBoundaryRecovery)
 }
 
 func TestParentFirstCandidateTerminalRace(t *testing.T) {
