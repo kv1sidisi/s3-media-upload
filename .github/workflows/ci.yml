@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quick:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Verify
+        run: |
+          test -z "$(gofmt -l .)"
+          GOTOOLCHAIN=local go mod tidy -diff
+          GOTOOLCHAIN=local go vet ./...
+          GOTOOLCHAIN=local go test -short -count=1 -shuffle=on -timeout=30s ./...
+
+  integration:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [full, race]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Start dependencies
+        run: |
+          cp .env.example .env
+          docker compose config --quiet
+          docker compose up --wait --wait-timeout 60 postgres garage
+          docker compose exec -T postgres \
+            psql -X --set=ON_ERROR_STOP=1 --single-transaction \
+            --username=media_upload --dbname=media_upload --file=- \
+            < migrations/0001_initial.sql
+      - name: Full gate
+        if: matrix.lane == 'full'
+        run: |
+          mkdir .ticket01-bin
+          TEST_MEMORY_LIMIT=2560m docker compose run --rm -T \
+            --volume "$PWD/.ticket01-bin:/out" \
+            --env GOMEMLIMIT=2GiB \
+            test sh -ec 'GOTOOLCHAIN=local go test -c -o /out/service.test .'
+          TEST_MEMORY_LIMIT=256m docker compose run --rm -T \
+            --volume "$PWD/.ticket01-bin:/out:ro" \
+            --env GOMEMLIMIT=230MiB \
+            test sh -ec '/out/service.test -test.count=1 -test.shuffle=on -test.timeout=3m'
+      - name: Race gate
+        if: matrix.lane == 'race'
+        run: |
+          TEST_MEMORY_LIMIT=2560m docker compose run --rm -T test \
+            sh -ec 'GOTOOLCHAIN=local go test -race -count=1 -shuffle=on -timeout=10m ./...'
+      - name: Clean up ephemeral runner
+        if: always()
+        run: |
+          rm -f .ticket01-bin/service.test
+          rmdir .ticket01-bin 2>/dev/null || true
+          docker compose down --volumes

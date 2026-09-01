@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"image"
 	"image/jpeg"
 	"image/png"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -212,7 +214,7 @@ func TestWorkerSchedulingAndCancellation(t *testing.T) {
 	})
 }
 
-func TestValidationMemoryHardCap(t *testing.T) {
+func TestValidationWorstCaseMemory(t *testing.T) {
 	t.Run("8192x1024 JPEG", func(t *testing.T) {
 		var encoded bytes.Buffer
 		if err := jpeg.Encode(&encoded, image.NewRGBA(image.Rect(0, 0, 8_192, 1_024)), nil); err != nil {
@@ -465,6 +467,195 @@ func TestDurableBoundaryRecovery(t *testing.T) {
 	}
 	t.Run("expiry durable boundaries", testExpiryDurableBoundaryRecovery)
 	t.Run("cleanup durable boundaries", testCleanupDurableBoundaryRecovery)
+}
+
+func TestRetryWholeTransaction(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires migrated PostgreSQL")
+	}
+	cfg := integrationConfig(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	pool, err := openPostgres(ctx, cfg.DatabaseURL)
+	if err != nil {
+		t.Fatal("open migrated PostgreSQL")
+	}
+	defer pool.Close()
+
+	firstID, firstKey := seedFinalizingUpload(t, ctx, pool, 1, "image/png")
+	defer cleanupUploadByIdempotencyKey(t, pool, firstKey)
+	secondID, secondKey := seedFinalizingUpload(t, ctx, pool, 1, "image/png")
+	defer cleanupUploadByIdempotencyKey(t, pool, secondKey)
+
+	blocker, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal("begin deadlock blocker")
+	}
+	defer blocker.Rollback(context.Background())
+	if _, err := blocker.Exec(ctx, "SET LOCAL deadlock_timeout = '2s'"); err != nil {
+		t.Fatal("configure deadlock blocker")
+	}
+	var lockedUploadID string
+	if err := blocker.QueryRow(ctx, `
+		SELECT upload_id::text
+		FROM uploads
+		WHERE upload_id = $1::uuid
+		FOR UPDATE`, secondID).Scan(&lockedUploadID); err != nil || lockedUploadID != secondID {
+		t.Fatal("lock second upload")
+	}
+	var blockerPID int32
+	if err := blocker.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&blockerPID); err != nil {
+		t.Fatal("read blocker backend PID")
+	}
+
+	type actorResult struct {
+		attempts       int
+		committed      bool
+		outcomeUnknown bool
+		err            error
+	}
+	firstLocked := make(chan struct{}, 1)
+	releaseSecondLock := make(chan struct{})
+	result := make(chan actorResult, 1)
+	go func() {
+		attempts := 0
+		committed, outcomeUnknown, err := retryUploadTransaction(
+			ctx,
+			pool,
+			func(databaseContext context.Context, tx pgx.Tx) (bool, error) {
+				attempts++
+				if _, err := tx.Exec(databaseContext, "SET LOCAL lock_timeout = '0'"); err != nil {
+					return false, err
+				}
+				if _, err := tx.Exec(databaseContext, "SET LOCAL deadlock_timeout = '100ms'"); err != nil {
+					return false, err
+				}
+				updated, err := tx.Exec(databaseContext, `
+					UPDATE uploads
+					SET declared_size = declared_size + 1
+					WHERE upload_id = $1::uuid`, firstID)
+				if err != nil {
+					return false, err
+				}
+				if updated.RowsAffected() != 1 {
+					return false, errors.New("retry transaction missed first upload")
+				}
+				if attempts == 1 {
+					firstLocked <- struct{}{}
+					select {
+					case <-releaseSecondLock:
+					case <-databaseContext.Done():
+						return false, databaseContext.Err()
+					}
+				}
+				updated, err = tx.Exec(databaseContext, `
+					UPDATE uploads
+					SET declared_size = declared_size + 1
+					WHERE upload_id = $1::uuid`, secondID)
+				return err == nil && updated.RowsAffected() == 1, err
+			},
+		)
+		result <- actorResult{
+			attempts:       attempts,
+			committed:      committed,
+			outcomeUnknown: outcomeUnknown,
+			err:            err,
+		}
+	}()
+
+	select {
+	case <-firstLocked:
+	case retryResult := <-result:
+		t.Fatalf("retry transaction stopped before its first row lock: %#v", retryResult)
+	case <-ctx.Done():
+		t.Fatal("retry transaction did not acquire its first row lock")
+	}
+	blockerResult := make(chan error, 1)
+	go func() {
+		var uploadID string
+		err := blocker.QueryRow(ctx, `
+			SELECT upload_id::text
+			FROM uploads
+			WHERE upload_id = $1::uuid
+			FOR UPDATE`, firstID).Scan(&uploadID)
+		if err == nil && uploadID != firstID {
+			err = errors.New("blocker locked the wrong upload")
+		}
+		blockerResult <- err
+	}()
+
+	blockerWaiting := false
+	for !blockerWaiting && ctx.Err() == nil {
+		if err := pool.QueryRow(ctx, `
+			SELECT cardinality(pg_blocking_pids($1::integer)) > 0`,
+			blockerPID,
+		).Scan(&blockerWaiting); err != nil {
+			t.Fatal("observe blocked transaction")
+		}
+	}
+	if !blockerWaiting {
+		t.Fatal("blocker was not observed waiting for the retry transaction")
+	}
+	close(releaseSecondLock)
+
+	select {
+	case err := <-blockerResult:
+		if err != nil {
+			t.Fatalf("blocker did not survive deadlock: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("PostgreSQL did not resolve the deadlock")
+	}
+	if err := blocker.Commit(ctx); err != nil {
+		t.Fatal("commit deadlock blocker")
+	}
+
+	var retryResult actorResult
+	select {
+	case retryResult = <-result:
+	case <-ctx.Done():
+		t.Fatal("retry transaction did not finish")
+	}
+	if retryResult.err != nil || !retryResult.committed || retryResult.outcomeUnknown || retryResult.attempts != 2 {
+		t.Fatalf("retry result=%#v", retryResult)
+	}
+
+	var firstSize, secondSize int64
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			(SELECT declared_size FROM uploads WHERE upload_id = $1::uuid),
+			(SELECT declared_size FROM uploads WHERE upload_id = $2::uuid)`,
+		firstID,
+		secondID,
+	).Scan(&firstSize, &secondSize); err != nil {
+		t.Fatal("read retry effects")
+	}
+	if firstSize != 2 || secondSize != 2 {
+		t.Fatalf("retry effects=%d,%d, want 2,2", firstSize, secondSize)
+	}
+}
+
+func TestResolveTerminalCommit(t *testing.T) {
+	commitErr := errors.New("commit outcome unknown")
+	confirmErr := errors.New("confirmation failed")
+	for _, test := range []struct {
+		name       string
+		confirmed  bool
+		confirmErr error
+		wantCommit bool
+		wantErr    error
+	}{
+		{name: "confirmed", confirmed: true, wantCommit: true},
+		{name: "not confirmed", wantErr: commitErr},
+		{name: "confirmation failed", confirmErr: confirmErr, wantErr: confirmErr},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			committed, err := resolveTerminalCommit(commitErr, test.confirmed, test.confirmErr)
+			if committed != test.wantCommit || !errors.Is(err, test.wantErr) {
+				t.Fatalf("committed=%t error=%v", committed, err)
+			}
+		})
+	}
 }
 
 func TestParentFirstCandidateTerminalRace(t *testing.T) {

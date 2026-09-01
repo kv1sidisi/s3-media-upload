@@ -658,78 +658,77 @@ func registerCandidate(
 	claim finalizeClaim,
 	candidate trackedCandidate,
 ) (bool, bool, error) {
-	tx, databaseContext, cancelDatabase, err := beginUploadTransaction(ctx, pool)
-	if err != nil {
-		return false, false, err
-	}
-	defer func() {
-		_ = tx.Rollback(databaseContext)
-		cancelDatabase()
-	}()
-	_, active, err := lockFinalizeParent(databaseContext, tx, claim)
-	if err != nil || !active {
-		return active, false, err
-	}
-	_, err = tx.Exec(databaseContext, `
-		INSERT INTO upload_candidates (
-			upload_id,
-			sha256,
-			object_key,
-			encoded_size,
-			validation_policy_version,
-			image_format,
-			width,
-			height,
-			registered_at
-		)
-		VALUES (
-			$1::uuid,
-			$2::bytea,
-			$3::text,
-			$4::bigint,
-			$5::smallint,
-			$6::text,
-			$7::integer,
-			$8::integer,
-			clock_timestamp()
-		)
-		ON CONFLICT (upload_id, sha256) DO NOTHING`,
-		claim.UploadID,
-		candidate.SHA256[:],
-		candidate.ObjectKey,
-		candidate.EncodedSize,
-		candidate.ValidationPolicyVersion,
-		candidate.Format,
-		candidate.Width,
-		candidate.Height,
+	var active, mismatch bool
+	committed, outcomeUnknown, err := retryUploadTransaction(
+		ctx,
+		pool,
+		func(databaseContext context.Context, tx pgx.Tx) (bool, error) {
+			active, mismatch = false, false
+			var lockErr error
+			_, active, lockErr = lockFinalizeParent(databaseContext, tx, claim)
+			if lockErr != nil || !active {
+				return false, lockErr
+			}
+			_, err := tx.Exec(databaseContext, `
+				INSERT INTO upload_candidates (
+					upload_id,
+					sha256,
+					object_key,
+					encoded_size,
+					validation_policy_version,
+					image_format,
+					width,
+					height,
+					registered_at
+				)
+				VALUES (
+					$1::uuid,
+					$2::bytea,
+					$3::text,
+					$4::bigint,
+					$5::smallint,
+					$6::text,
+					$7::integer,
+					$8::integer,
+					clock_timestamp()
+				)
+				ON CONFLICT (upload_id, sha256) DO NOTHING`,
+				claim.UploadID,
+				candidate.SHA256[:],
+				candidate.ObjectKey,
+				candidate.EncodedSize,
+				candidate.ValidationPolicyVersion,
+				candidate.Format,
+				candidate.Width,
+				candidate.Height,
+			)
+			if err != nil {
+				return false, err
+			}
+			stored, err := scanTrackedCandidate(tx.QueryRow(databaseContext, `
+				SELECT
+					sha256,
+					object_key,
+					encoded_size,
+					validation_policy_version,
+					image_format,
+					width,
+					height
+				FROM upload_candidates
+				WHERE upload_id = $1::uuid
+				  AND sha256 = $2::bytea
+				FOR UPDATE`,
+				claim.UploadID,
+				candidate.SHA256[:],
+			))
+			if err != nil {
+				return false, err
+			}
+			mismatch = !sameCandidate(stored, candidate)
+			return !mismatch, nil
+		},
 	)
-	if err != nil {
-		return true, false, err
-	}
-	stored, err := scanTrackedCandidate(tx.QueryRow(databaseContext, `
-		SELECT
-			sha256,
-			object_key,
-			encoded_size,
-			validation_policy_version,
-			image_format,
-			width,
-			height
-		FROM upload_candidates
-		WHERE upload_id = $1::uuid
-		  AND sha256 = $2::bytea
-		FOR UPDATE`,
-		claim.UploadID,
-		candidate.SHA256[:],
-	))
-	if err != nil {
-		return true, false, err
-	}
-	if !sameCandidate(stored, candidate) {
-		return true, true, nil
-	}
-	if err := tx.Commit(databaseContext); err != nil {
-		cancelDatabase()
+	if outcomeUnknown {
 		exact, confirmErr := candidateTracked(ctx, pool, claim.UploadID, candidate)
 		if confirmErr != nil {
 			return false, false, confirmErr
@@ -739,8 +738,13 @@ func registerCandidate(
 		}
 		return true, false, nil
 	}
-	cancelDatabase()
-	return true, false, nil
+	if err != nil {
+		return false, false, err
+	}
+	if mismatch {
+		return true, true, nil
+	}
+	return active && committed, false, nil
 }
 
 func candidateTracked(
@@ -843,75 +847,70 @@ func transitionFinalizeReady(
 	claim finalizeClaim,
 	selected trackedCandidate,
 ) (bool, error) {
-	tx, databaseContext, cancelDatabase, err := beginUploadTransaction(ctx, pool)
-	if err != nil {
-		return false, err
-	}
-	defer func() {
-		_ = tx.Rollback(databaseContext)
-		cancelDatabase()
-	}()
-	parent, active, err := lockFinalizeParent(databaseContext, tx, claim)
-	if err != nil || !active {
-		return false, err
-	}
-	candidates, err := lockAllCandidates(databaseContext, tx, claim.UploadID)
-	if err != nil {
-		return false, err
-	}
-	found := false
-	for _, candidate := range candidates {
-		if sameCandidate(candidate, selected) {
-			found = true
-		}
-	}
-	if !found {
-		return false, errors.New("selected candidate is not tracked")
-	}
-	var selectedTombstoned bool
-	if err := tx.QueryRow(databaseContext, `
-		SELECT EXISTS (
-			SELECT 1
-			FROM cleanup_tombstones
-			WHERE object_key = $1::text
-		)`,
-		selected.ObjectKey,
-	).Scan(&selectedTombstoned); err != nil {
-		return false, err
-	}
-	if selectedTombstoned {
-		return false, errors.New("selected candidate is tombstoned")
-	}
-	targets := terminalTombstones(parent, candidates, selected.ObjectKey)
-	if err := ensureTombstones(databaseContext, tx, claim.UploadID, targets); err != nil {
-		return false, err
-	}
-	result, err := tx.Exec(databaseContext, `
-		UPDATE uploads
-		SET state = 'ready',
-		    reconcile_after = NULL,
-		    claim_token = NULL,
-		    claim_expires_at = NULL,
-		    terminal_at = $3::timestamptz,
-		    final_key = $4::text
-		WHERE upload_id = $1::uuid
-		  AND state = 'finalizing'
-		  AND claim_token = $2::uuid
-		  AND claim_expires_at > $3::timestamptz`,
-		claim.UploadID,
-		claim.Token,
-		parent.DatabaseNow,
-		selected.ObjectKey,
+	committed, outcomeUnknown, err := retryUploadTransaction(
+		ctx,
+		pool,
+		func(databaseContext context.Context, tx pgx.Tx) (bool, error) {
+			parent, active, err := lockFinalizeParent(databaseContext, tx, claim)
+			if err != nil || !active {
+				return false, err
+			}
+			candidates, err := lockAllCandidates(databaseContext, tx, claim.UploadID)
+			if err != nil {
+				return false, err
+			}
+			found := false
+			for _, candidate := range candidates {
+				if sameCandidate(candidate, selected) {
+					found = true
+				}
+			}
+			if !found {
+				return false, errors.New("selected candidate is not tracked")
+			}
+			var selectedTombstoned bool
+			if err := tx.QueryRow(databaseContext, `
+				SELECT EXISTS (
+					SELECT 1
+					FROM cleanup_tombstones
+					WHERE object_key = $1::text
+				)`,
+				selected.ObjectKey,
+			).Scan(&selectedTombstoned); err != nil {
+				return false, err
+			}
+			if selectedTombstoned {
+				return false, errors.New("selected candidate is tombstoned")
+			}
+			targets := terminalTombstones(parent, candidates, selected.ObjectKey)
+			if err := ensureTombstones(databaseContext, tx, claim.UploadID, targets); err != nil {
+				return false, err
+			}
+			result, err := tx.Exec(databaseContext, `
+				UPDATE uploads
+				SET state = 'ready',
+				    reconcile_after = NULL,
+				    claim_token = NULL,
+				    claim_expires_at = NULL,
+				    terminal_at = $3::timestamptz,
+				    final_key = $4::text
+				WHERE upload_id = $1::uuid
+				  AND state = 'finalizing'
+				  AND claim_token = $2::uuid
+				  AND claim_expires_at > $3::timestamptz`,
+				claim.UploadID,
+				claim.Token,
+				parent.DatabaseNow,
+				selected.ObjectKey,
+			)
+			return err == nil && result.RowsAffected() == 1, err
+		},
 	)
-	if err != nil || result.RowsAffected() != 1 {
-		return false, err
+	if outcomeUnknown {
+		confirmed, confirmErr := confirmReady(ctx, pool, claim.UploadID, selected.ObjectKey)
+		return resolveTerminalCommit(err, confirmed, confirmErr)
 	}
-	if err := tx.Commit(databaseContext); err != nil {
-		cancelDatabase()
-		return confirmReady(ctx, pool, claim.UploadID, selected.ObjectKey)
-	}
-	cancelDatabase()
-	return true, nil
+	return committed, err
 }
 
 func transitionFinalizeRejected(
@@ -924,59 +923,64 @@ func transitionFinalizeRejected(
 	if err != nil || len(failure.Evidence) == 0 {
 		return false, errors.New("invalid rejection evidence")
 	}
-	tx, databaseContext, cancelDatabase, err := beginUploadTransaction(ctx, pool)
-	if err != nil {
-		return false, err
-	}
-	defer func() {
-		_ = tx.Rollback(databaseContext)
-		cancelDatabase()
-	}()
-	parent, active, err := lockFinalizeParent(databaseContext, tx, claim)
-	if err != nil || !active {
-		return false, err
-	}
-	candidates, err := lockAllCandidates(databaseContext, tx, claim.UploadID)
-	if err != nil {
-		return false, err
-	}
-	targets := terminalTombstones(parent, candidates, "")
-	if err := ensureTombstones(databaseContext, tx, claim.UploadID, targets); err != nil {
-		return false, err
-	}
-	result, err := tx.Exec(databaseContext, `
-		UPDATE uploads
-		SET state = 'rejected',
-		    reconcile_after = NULL,
-		    claim_token = NULL,
-		    claim_expires_at = NULL,
-		    terminal_at = $3::timestamptz,
-		    rejection_class = $4::text,
-		    rejection_reason = $5::text,
-		    rejection_policy_version = 1,
-		    rejection_phase = $6::text,
-		    rejection_evidence = $7::jsonb
-		WHERE upload_id = $1::uuid
-		  AND state = 'finalizing'
-		  AND claim_token = $2::uuid
-		  AND claim_expires_at > $3::timestamptz`,
-		claim.UploadID,
-		claim.Token,
-		parent.DatabaseNow,
-		failure.Class,
-		failure.Reason,
-		failure.Phase,
-		string(evidence),
+	committed, outcomeUnknown, err := retryUploadTransaction(
+		ctx,
+		pool,
+		func(databaseContext context.Context, tx pgx.Tx) (bool, error) {
+			parent, active, err := lockFinalizeParent(databaseContext, tx, claim)
+			if err != nil || !active {
+				return false, err
+			}
+			candidates, err := lockAllCandidates(databaseContext, tx, claim.UploadID)
+			if err != nil {
+				return false, err
+			}
+			targets := terminalTombstones(parent, candidates, "")
+			if err := ensureTombstones(databaseContext, tx, claim.UploadID, targets); err != nil {
+				return false, err
+			}
+			result, err := tx.Exec(databaseContext, `
+				UPDATE uploads
+				SET state = 'rejected',
+				    reconcile_after = NULL,
+				    claim_token = NULL,
+				    claim_expires_at = NULL,
+				    terminal_at = $3::timestamptz,
+				    rejection_class = $4::text,
+				    rejection_reason = $5::text,
+				    rejection_policy_version = 1,
+				    rejection_phase = $6::text,
+				    rejection_evidence = $7::jsonb
+				WHERE upload_id = $1::uuid
+				  AND state = 'finalizing'
+				  AND claim_token = $2::uuid
+				  AND claim_expires_at > $3::timestamptz`,
+				claim.UploadID,
+				claim.Token,
+				parent.DatabaseNow,
+				failure.Class,
+				failure.Reason,
+				failure.Phase,
+				string(evidence),
+			)
+			return err == nil && result.RowsAffected() == 1, err
+		},
 	)
-	if err != nil || result.RowsAffected() != 1 {
-		return false, err
+	if outcomeUnknown {
+		confirmed, confirmErr := confirmRejected(ctx, pool, claim.UploadID, failure.Reason)
+		return resolveTerminalCommit(err, confirmed, confirmErr)
 	}
-	if err := tx.Commit(databaseContext); err != nil {
-		cancelDatabase()
-		return confirmRejected(ctx, pool, claim.UploadID, failure.Reason)
+	return committed, err
+}
+
+func resolveTerminalCommit(commitErr error, confirmed bool, confirmErr error) (bool, error) {
+	if confirmErr != nil {
+		return false, confirmErr
 	}
-	cancelDatabase()
-	return true, nil
+	if confirmed {
+		return true, nil
+	}
+	return false, commitErr
 }
 
 type lockedFinalizeUpload struct {

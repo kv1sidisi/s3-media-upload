@@ -579,7 +579,7 @@ func TestExactDispatcherAndRepresentation(t *testing.T) {
 	t.Run("ready image representation", testUploadRepresentationImageIsOptional)
 }
 
-func TestIntegrationCreateIdempotencyAndRecovery(t *testing.T) {
+func TestCreateSameKeyWinner(t *testing.T) {
 	if testing.Short() {
 		t.Skip("requires migrated PostgreSQL")
 	}

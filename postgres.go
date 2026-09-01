@@ -8,12 +8,14 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 const (
 	databaseStartupTimeout = 5 * time.Second
 	uploadDatabaseTimeout  = 5 * time.Second
+	databaseTxAttempts     = 2
 )
 
 func openPostgres(parent context.Context, databaseURL string) (*pgxpool.Pool, error) {
@@ -721,6 +723,49 @@ func beginUploadTransaction(
 		return nil, nil, nil, err
 	}
 	return tx, databaseContext, cancelDatabase, nil
+}
+
+func retryUploadTransaction(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	apply func(context.Context, pgx.Tx) (bool, error),
+) (bool, bool, error) {
+	for attempt := 0; attempt < databaseTxAttempts; attempt++ {
+		tx, databaseContext, cancelDatabase, err := beginUploadTransaction(ctx, pool)
+		if err != nil {
+			if retryableTransactionError(err) && attempt+1 < databaseTxAttempts {
+				continue
+			}
+			return false, false, err
+		}
+
+		commit, err := apply(databaseContext, tx)
+		if err != nil || !commit {
+			_ = tx.Rollback(databaseContext)
+			cancelDatabase()
+			if err != nil && retryableTransactionError(err) && attempt+1 < databaseTxAttempts {
+				continue
+			}
+			return false, false, err
+		}
+
+		err = tx.Commit(databaseContext)
+		cancelDatabase()
+		if err == nil {
+			return true, false, nil
+		}
+		if retryableTransactionError(err) && attempt+1 < databaseTxAttempts {
+			continue
+		}
+		return false, !retryableTransactionError(err), err
+	}
+	return false, false, errors.New("database transaction retry exhausted")
+}
+
+func retryableTransactionError(err error) bool {
+	var postgresError *pgconn.PgError
+	return errors.As(err, &postgresError) &&
+		(postgresError.Code == "40001" || postgresError.Code == "40P01")
 }
 
 func uploadSigningError(err error) error {

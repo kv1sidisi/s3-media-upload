@@ -213,61 +213,56 @@ func transitionFinalizeExpiredMissing(
 	observedHorizon time.Time,
 	observedCandidates []trackedCandidate,
 ) (bool, error) {
-	tx, databaseContext, cancelDatabase, err := beginUploadTransaction(ctx, pool)
-	if err != nil {
-		return false, err
-	}
-	defer func() {
-		_ = tx.Rollback(databaseContext)
-		cancelDatabase()
-	}()
-	parent, active, err := lockFinalizeParent(databaseContext, tx, claim)
-	if err != nil || !active {
-		return false, err
-	}
-	if !parent.MaxWriteExpiresAt.Equal(observedHorizon) ||
-		parent.DatabaseNow.Before(parent.UploadDeadline) ||
-		parent.DatabaseNow.Before(parent.MaxWriteExpiresAt) {
-		return false, nil
-	}
-	candidates, err := lockAllCandidates(databaseContext, tx, claim.UploadID)
-	if err != nil {
-		return false, err
-	}
-	if !sameCandidateList(candidates, observedCandidates) {
-		return false, nil
-	}
-	if err := ensureTombstones(
-		databaseContext,
-		tx,
-		claim.UploadID,
-		terminalTombstones(parent, candidates, ""),
-	); err != nil {
-		return false, err
-	}
-	result, err := tx.Exec(databaseContext, `
-		UPDATE uploads
-		SET state = 'expired',
-		    reconcile_after = NULL,
-		    claim_token = NULL,
-		    claim_expires_at = NULL,
-		    terminal_at = $3::timestamptz,
-		    expiry_reason = 'staging_missing_after_write_window'
-		WHERE upload_id = $1::uuid
-		  AND state = 'finalizing'
-		  AND claim_token = $2::uuid
-		  AND claim_expires_at > $3::timestamptz
-		  AND max_write_expires_at = $4::timestamptz`,
-		claim.UploadID,
-		claim.Token,
-		parent.DatabaseNow,
-		observedHorizon,
+	committed, outcomeUnknown, err := retryUploadTransaction(
+		ctx,
+		pool,
+		func(databaseContext context.Context, tx pgx.Tx) (bool, error) {
+			parent, active, err := lockFinalizeParent(databaseContext, tx, claim)
+			if err != nil || !active {
+				return false, err
+			}
+			if !parent.MaxWriteExpiresAt.Equal(observedHorizon) ||
+				parent.DatabaseNow.Before(parent.UploadDeadline) ||
+				parent.DatabaseNow.Before(parent.MaxWriteExpiresAt) {
+				return false, nil
+			}
+			candidates, err := lockAllCandidates(databaseContext, tx, claim.UploadID)
+			if err != nil {
+				return false, err
+			}
+			if !sameCandidateList(candidates, observedCandidates) {
+				return false, nil
+			}
+			if err := ensureTombstones(
+				databaseContext,
+				tx,
+				claim.UploadID,
+				terminalTombstones(parent, candidates, ""),
+			); err != nil {
+				return false, err
+			}
+			result, err := tx.Exec(databaseContext, `
+				UPDATE uploads
+				SET state = 'expired',
+				    reconcile_after = NULL,
+				    claim_token = NULL,
+				    claim_expires_at = NULL,
+				    terminal_at = $3::timestamptz,
+				    expiry_reason = 'staging_missing_after_write_window'
+				WHERE upload_id = $1::uuid
+				  AND state = 'finalizing'
+				  AND claim_token = $2::uuid
+				  AND claim_expires_at > $3::timestamptz
+				  AND max_write_expires_at = $4::timestamptz`,
+				claim.UploadID,
+				claim.Token,
+				parent.DatabaseNow,
+				observedHorizon,
+			)
+			return err == nil && result.RowsAffected() == 1, err
+		},
 	)
-	if err != nil || result.RowsAffected() != 1 {
-		return false, err
-	}
-	if err := tx.Commit(databaseContext); err != nil {
-		cancelDatabase()
+	if outcomeUnknown {
 		return confirmFinalizeExpiredMissing(
 			ctx,
 			pool,
@@ -276,8 +271,7 @@ func transitionFinalizeExpiredMissing(
 			len(observedCandidates),
 		)
 	}
-	cancelDatabase()
-	return true, nil
+	return committed, err
 }
 
 func sameCandidateList(left, right []trackedCandidate) bool {

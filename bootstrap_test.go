@@ -129,7 +129,7 @@ func TestOperationalEndpointsAndRedaction(t *testing.T) {
 	}
 }
 
-func TestHTTPHeaderBoundary(t *testing.T) {
+func TestE2EHTTPHeaderBoundary(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	app := &application{
 		logger:       logger,

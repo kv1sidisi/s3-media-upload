@@ -1,56 +1,91 @@
 # s3-media-upload
 
-`s3-media-upload` is a small Go foundation for a direct-to-S3 media upload service.
-The current slice provides a loopback HTTP process, PostgreSQL schema v1, idempotent
-upload creation, 15-minute direct PUT capabilities, authoritative pending reads, local
-Garage configuration, durable asynchronous completion intent, authoritative status
-reads, verified JPEG/PNG publication, ready-only direct content reads, health probes,
-structured logs, process counters, and permanent tombstone cleanup.
+`s3-media-upload` is a small Go service for direct image uploads to S3-compatible
+storage. The API stores lifecycle intent in PostgreSQL, sends image bytes directly
+between the client and storage, verifies an immutable candidate before publication,
+and retains permanent cleanup duties for staging and losing objects.
+
+The supported profile is a trusted-host, loopback-only local demo. It is not a public
+upload service or a production deployment.
 
 ## Status
 
-### Implemented
+| Label | Current truth |
+| --- | --- |
+| Implemented | The current working tree contains the complete local service, canonical `U1-U5`, `P1-P6`, `S1`, and `E1-E6` tests, Compose environment, and CI workflow. The working tree is not an immutable revision. |
+| Planned | Create a clean immutable revision, run the exact full and race gates, then run the live demo on that same revision. Commit, push, remote CI, deployment, and live AWS are separate operations. |
+| Observed | No ticket-07 full/race/demo evidence has been recorded on one clean immutable revision. The historical local working-tree observations below do not satisfy that claim. |
 
-- strict loopback-only configuration;
-- forward-only PostgreSQL schema v1;
-- `POST /uploads` with durable idempotency and presigned direct PUT instructions;
-- `POST /uploads/{upload_id}/complete` with restart-safe `finalizing` intent;
-- a sequential fenced finalizer with bounded validation, candidate publication, and
-  full-GET verification;
-- time-driven abandoned and confirmed-missing expiry with durable cleanup duties;
-- immutable `ready`/`rejected` outcomes and `GET /uploads/{upload_id}/content`;
-- DB-driven at-least-once cleanup of staging and unselected candidate objects;
-- `GET /uploads/{upload_id}` with an authoritative PostgreSQL representation;
-- `GET /livez`, `GET /readyz`, and `GET /debug/vars`;
-- bounded PostgreSQL and signed S3 readiness checks;
-- JSON logs and a fixed `media_upload_service` expvar subtree;
-- coordinated HTTP, finalizer, and maintenance shutdown;
-- pinned local PostgreSQL, Garage, and Go test containers.
+## Data flow
 
-### Observed
+1. `POST /uploads` commits an upload identity and returns a 15-minute presigned
+   single-part `PUT` capability.
+2. The client sends the declared JPEG or PNG directly to storage; the API never
+   receives image bytes.
+3. `POST /uploads/{upload_id}/complete` commits asynchronous finalization intent.
+4. One sequential finalizer captures and validates the staging bytes, tracks a
+   content-addressed candidate before writing it, then verifies a complete candidate
+   `GET` before committing `ready`.
+5. `GET /uploads/{upload_id}/content` returns a five-minute direct-read redirect only
+   for `ready` uploads.
+6. One maintenance loop expires unfinished uploads and repeatedly deletes only
+   DB-recorded staging or unselected candidate objects.
 
-On 2026-08-31, the following passed from a local, uncommitted working tree:
+PostgreSQL is authoritative for identity, lifecycle, retry intent, the selected key,
+and cleanup duties. Storage is authoritative only for bytes. No S3 call runs inside a
+PostgreSQL transaction.
 
-- pinned Go 1.26.7, an empty `gofmt -l` result, `go vet ./...`, and the canonical quick gate;
-- healthy pinned PostgreSQL 18.6 and Garage 2.3.0 with schema v1 present;
-- the complete root-package test binary, built under a hard no-swap 2560 MiB limit and
-  executed against PostgreSQL and Garage under a hard no-swap 256 MiB limit
-  (`GOMEMLIMIT=230MiB`), with shuffle seed `1788200551998977133` and result `PASS`;
-- the complete race suite under a hard no-swap 2560 MiB limit, with zero race reports
-  and result `ok` in 17.811 seconds.
+## HTTP API
 
-This is local ticket-04 working-tree evidence, not evidence for an immutable revision.
-A manual demo, live AWS, and deployment have not been observed.
+The application surface is unversioned and has exactly four endpoints:
 
-## Prerequisites
+| Method | Path | Result |
+| --- | --- | --- |
+| `POST` | `/uploads` | `201` for creation, `200` for an exact replay, `422` if the idempotency key is reused with different declarations. |
+| `POST` | `/uploads/{upload_id}/complete` | `202` while finalizing; terminal replays return the authoritative terminal representation. |
+| `GET` | `/uploads/{upload_id}` | Current `pending`, `finalizing`, `ready`, `rejected`, or `expired` state without a storage capability. |
+| `GET` | `/uploads/{upload_id}/content` | Empty `307` direct-read redirect only for `ready`; state-specific errors otherwise. |
 
-- Go 1.26.7;
-- Docker with Compose 2.17.0 or newer.
+Operational endpoints are `GET /livez`, `GET /readyz`, and `GET /debug/vars`.
+`/livez` does not call dependencies. `/readyz` checks PostgreSQL and signed S3 access
+sequentially with a two-second timeout per dependency. `/debug/vars` exposes the fixed
+`media_upload_service` expvar subtree without dependency calls.
 
-The supported runtime is a trusted-host local demo. The HTTP service binds to loopback,
-and Compose publishes PostgreSQL and Garage host ports only on `127.0.0.1`.
+Requests and responses use JSON except for the empty `307`. Handler responses include
+`Cache-Control: no-store`; content redirects use `private, no-store` and `nosniff`.
+The raw request line plus headers is limited to 16,384 bytes, JSON bodies are limited
+to 16,384 bytes, and bodyless endpoints require an empty body.
 
-## Run locally
+## Version contract and prerequisites
+
+| Component | Supported value |
+| --- | --- |
+| Go | Exact `1.26.7` with `GOTOOLCHAIN=local`. |
+| Docker Compose | Plugin command `docker compose`, version `2.17.0` or newer. |
+| PostgreSQL | `postgres:18.6-bookworm@sha256:1c59e2c3c818eaa0f0628f695b36e7c9e362d6b219b36a54a32df645cbd7e1af`. |
+| Garage | `dxflrs/garage:v2.3.0@sha256:866bd13ed2038ba7e7190e840482bc27234c4afaf77be8cfa439ae088c1e4690`, single-node consistent mode. |
+| Full/race Go image | `golang:1.26.7-bookworm@sha256:e8c859f5632dcfde7b32d2012b4351728f6437930887c2f6a91ea242459e5514`. |
+
+Compose publishes PostgreSQL on `127.0.0.1:55432` and Garage S3 on
+`127.0.0.1:3900`. Garage RPC, web, and admin ports are not published.
+
+## Configuration
+
+| Variable | Required | Contract |
+| --- | --- | --- |
+| `HTTP_ADDR` | No | Defaults to `127.0.0.1:8080`; a literal loopback IP and port are required. |
+| `DATABASE_URL` | Yes | PostgreSQL DSN; never logged. |
+| `S3_BUCKET` | Yes | Dedicated private bucket. |
+| `AWS_REGION` | Yes | AWS signing region. |
+| `S3_ENDPOINT` | No | Origin-only loopback HTTP URL for local Garage; omitted for standard AWS HTTPS resolution. |
+| `FINALIZE_CLAIM_LEASE` | No | Defaults to `30s` and must exceed the fixed ten-second S3 operation deadline. |
+
+AWS credentials use the standard AWS SDK chain. `.env.example` contains disposable
+loopback values only; `.env` is ignored. Never reuse those values for remote storage.
+
+## Fresh bootstrap
+
+From a fresh checkout:
 
 ```sh
 cp .env.example .env
@@ -66,128 +101,155 @@ set +a
 GOTOOLCHAIN=local go run .
 ```
 
-In another terminal:
+The migration is intentionally external and applies schema ledger version `1`. If old
+local named volumes must be discarded before a fresh bootstrap, stop the stack and run
+`docker compose down --volumes`; this permanently deletes the local PostgreSQL and
+Garage data.
+
+## Live demo
+
+Start the timer only after the dependencies and service are ready. The following flow
+must finish within eight minutes. Do not capture raw response bodies or redirect
+headers because they contain bearer capabilities.
+
+In a second terminal, record one valid PNG and a fresh canonical lowercase UUIDv4.
+The input line is: path without spaces, SHA-256, byte size, width, height, and key.
 
 ```sh
-curl --fail-with-body http://127.0.0.1:8080/livez
-curl --fail-with-body http://127.0.0.1:8080/readyz
-curl --fail-with-body http://127.0.0.1:8080/debug/vars
+API=http://127.0.0.1:8080
+read -r DEMO_IMAGE DEMO_SHA256 DEMO_SIZE DEMO_WIDTH DEMO_HEIGHT IDEMPOTENCY_KEY
+curl --include "$API/livez"
+curl --include "$API/readyz"
+curl --silent --show-error "$API/debug/vars"
 ```
 
-`/livez` does not call dependencies. `/readyz` checks PostgreSQL and S3 sequentially
-with a two-second timeout per dependency. `/debug/vars` exposes standard Go expvar data
-and the service subtree without calling dependencies.
-
-Create an upload resource with declarations only:
+Create the upload. Record the `upload_id` and opaque upload instructions without
+copying the URL into evidence:
 
 ```sh
-curl --fail-with-body \
-  --request POST http://127.0.0.1:8080/uploads \
+curl --include --request POST "$API/uploads" \
+  --header "Idempotency-Key: $IDEMPOTENCY_KEY" \
   --header 'Content-Type: application/json' \
-  --header "Idempotency-Key: ${IDEMPOTENCY_KEY:?set to a canonical lowercase UUIDv4}" \
-  --data '{"size_bytes":123456,"content_type":"image/jpeg"}'
+  --data "{\"size_bytes\":$DEMO_SIZE,\"content_type\":\"image/png\"}"
 ```
 
-The response contains an opaque `upload_request`. Send the image directly to its URL
-with the returned method and complete headers map, without following redirects. Exact
-create replays return the same upload resource and a newly authorized URL while the
-write window is open. A successful storage PUT still leaves the resource `pending`.
+Repeat that exact command. The replay must return `200` and the same `upload_id`; it
+must not create a second `none_to_pending` counter delta.
 
-After the PUT completes, durably submit asynchronous completion intent with an empty
-body:
+Enter the replay result through `read` so the bearer URL is not placed in shell
+history, then perform the direct storage write:
 
 ```sh
-curl --fail-with-body \
-  --request POST \
-  --header 'Content-Length: 0' \
-  "http://127.0.0.1:8080/uploads/${UPLOAD_ID:?set from the create response}/complete"
+read -r UPLOAD_ID PUT_URL
+curl --include --request PUT \
+  --header 'Content-Type: image/png' \
+  --data-binary @"$DEMO_IMAGE" \
+  "$PUT_URL"
+unset PUT_URL
 ```
 
-A timely request returns `202` and `finalizing`; an exact replay also returns `202` and
-wakes recovery without changing the original completion time. The completion handler
-does not inspect S3 or validate bytes. The sequential finalizer later captures one
-bounded staging snapshot, validates it, tracks a content-addressed candidate before
-writing, and performs a full length-and-SHA-256 GET verification before committing
-`ready`. Invalid input becomes an immutable safe `rejected` outcome. A request at or
-after the upload deadline atomically expires the upload and records staging cleanup
-work. Claims are fenced leases, not exactly-once execution: after a crash or ambiguous
-PUT, a fresh worker verifies every tracked candidate before reading staging again.
-Pending uploads expire after their half-open 24-hour deadline. A finalizing upload
-expires only after every tracked candidate was reconciled and a fresh authenticated
-staging read confirms absence after both the upload and authorized-write horizons.
+A native storage `2xx` proves only transport success. The service deliberately emits
+no `put_succeeded` event because this data path bypasses it.
 
-`GET /uploads/{upload_id}` reads the current state from PostgreSQL and never returns a
-storage URL, bucket, object key, ETag, digest, completion timestamp, claim, or retry
-metadata. Ready representations contain only decoder-derived image metadata.
-`GET /uploads/{upload_id}/content` returns a five-minute `307` capability only for
-`ready`; the API never accepts or proxies image bytes.
+Commit completion intent, then repeat the status request until it returns `ready`
+within the time box:
 
-Terminal decisions commit permanent cleanup tombstones for staging and unselected
-candidate keys. The single maintenance loop reserves up to ten due tombstones, commits
-the reservation before a bounded `DeleteObject`, and applies the result only through the
-exact reservation token. Transient and ambiguous failures back off from one minute to
-one hour; deterministic failures retry hourly. Success or confirmed absence schedules
-another protective sweep after 24 hours, so a late in-flight PUT still converges. The
-selected `final_key` never receives a tombstone. Cleanup is idempotent and at least once,
-not exactly once.
+```sh
+curl --include --request POST "$API/uploads/$UPLOAD_ID/complete"
+curl --include "$API/uploads/$UPLOAD_ID"
+curl --silent --show-error "$API/debug/vars"
+```
 
-`/debug/vars` exposes cleanup attempts, durable outcomes, retries, due count, oldest due
-age, and snapshot time under `media_upload_service`. `SIGINT` or `SIGTERM` cancels worker
-S3 calls, drains active HTTP requests with an independent ten-second budget, waits for
-both workers, and closes PostgreSQL last.
+The completion response must be `202 finalizing`. The final status must contain
+decoder-derived size, MIME type, width, and height, but no URL, key, digest, claim, or
+retry metadata. Safe logs should show create, capability, completion, finalize-phase,
+and terminal events for the same `upload_id`.
 
-## Configuration
+Finally, observe the ready-only redirect, download through a fresh redirect, and
+compare exact bytes:
 
-| Variable | Required | Contract |
-| --- | --- | --- |
-| `HTTP_ADDR` | No | Defaults to `127.0.0.1:8080`; a literal loopback IP and port are required. |
-| `DATABASE_URL` | Yes | PostgreSQL DSN; never logged. |
-| `S3_BUCKET` | Yes | Dedicated private bucket name. |
-| `AWS_REGION` | Yes | AWS signing region. |
-| `S3_ENDPOINT` | No | Origin-only loopback HTTP URL for local Garage. |
-| `FINALIZE_CLAIM_LEASE` | No | Defaults to `30s`; minimum `10.000001s` so it exceeds the fixed 10-second S3 deadline at PostgreSQL precision. |
+```sh
+curl --include "$API/uploads/$UPLOAD_ID/content"
+DOWNLOADED_IMAGE=/tmp/media-upload-demo-result.png
+curl --fail --location --output "$DOWNLOADED_IMAGE" \
+  "$API/uploads/$UPLOAD_ID/content"
+cmp "$DEMO_IMAGE" "$DOWNLOADED_IMAGE"
+```
 
-AWS credentials use the standard AWS SDK chain. `.env.example` contains disposable
-local values only; `.env` is ignored.
+Success is `/livez=200`, `/readyz=200`, create `201`, exact replay `200` with the same
+ID, direct PUT `2xx`, completion `202`, terminal `ready`, content `307`, and `cmp=0`.
 
 ## Verification
 
-Run the host checks from the module root. Then start the dependencies, migrate schema
-v1 as shown above, and run the split integration gate:
+Run host-only checks from the module root:
 
 ```sh
-test -z "$(gofmt -l *.go)"
+docker compose config --quiet
+GOTOOLCHAIN=local go mod tidy -diff
+test -z "$(gofmt -l .)"
 GOTOOLCHAIN=local go vet ./...
 GOTOOLCHAIN=local go test -short -count=1 -shuffle=on -timeout=30s ./...
+```
 
-mkdir .test-bin
+For full and race gates, start fresh dependencies and apply the migration as shown in
+the bootstrap section. The full logical gate separates cold compilation from execution
+without weakening the 256 MiB execution boundary:
+
+```sh
+mkdir .ticket01-bin
 TEST_MEMORY_LIMIT=2560m docker compose run --rm -T \
-  --volume "$PWD/.test-bin:/out" \
+  --volume "$PWD/.ticket01-bin:/out" \
   --env GOMEMLIMIT=2GiB \
   test sh -ec 'GOTOOLCHAIN=local go test -c -o /out/service.test .'
 TEST_MEMORY_LIMIT=256m docker compose run --rm -T \
-  --volume "$PWD/.test-bin:/out:ro" \
+  --volume "$PWD/.ticket01-bin:/out:ro" \
   --env GOMEMLIMIT=230MiB \
   test sh -ec '/out/service.test -test.count=1 -test.shuffle=on -test.timeout=3m'
-rm -f .test-bin/service.test
-rmdir .test-bin
+rm -f .ticket01-bin/service.test
+rmdir .ticket01-bin
 
-TEST_MEMORY_LIMIT=2560m docker compose run --rm -T \
-  --env GOMEMLIMIT=2GiB \
-  test sh -ec \
-  'GOTOOLCHAIN=local go test -race -count=1 -shuffle=on -timeout=10m ./...'
+TEST_MEMORY_LIMIT=2560m docker compose run --rm -T test \
+  sh -ec 'GOTOOLCHAIN=local go test -race -count=1 -shuffle=on -timeout=10m ./...'
 ```
 
-Cold compilation did not fit the 256 MiB execution envelope, including serialized and
-reduced-compiler-memory attempts. Compilation therefore has its own 2560 MiB envelope;
-the resulting binary still executes the complete integration suite under 256 MiB. The
-race suite executes separately under the 2560 MiB envelope.
+Full and race must execute integration, concurrency, ambiguity, cleanup, and shutdown
+paths without a skip, timeout, hang, or race report. In particular, the full suite
+contains `TestParentFirstCandidateTerminalRace` and
+`TestE2EFinalizeRecovery/delegate_then_fail`; no separate `-run` or `-v` command is
+used as substitute evidence. GitHub Actions runs the same quick/full/race gates and
+deletes Compose volumes only on its ephemeral runner.
+
+## Evidence
+
+| Evidence | Revision | Environment | Result | Claim |
+| --- | --- | --- | --- | --- |
+| Historical local gates, 2026-08-31 | Uncommitted working tree; not immutable | Go 1.26.7, PostgreSQL 18.6, Garage 2.3.0; full build 2560 MiB, full execution 256 MiB, race 2560 MiB | Format, vet, quick, full, and race passed; full seed `1788200551998977133`; race completed without a report in 17.811 seconds | Diagnostic working-tree evidence only. It does not satisfy ticket-07 clean-revision evidence. |
+| Ticket-07 full/race/demo | None | Not run | No result recorded | No `Observed` clean-revision claim. |
+
+A future qualifying record must use one full immutable revision and include the clean
+tree fact, UTC date, runner/OS/architecture, actual tool versions and image digests,
+Garage mode, migration ledger, memory envelope, exact command/input, duration/result,
+skip/timeout/race facts, safe event/counter deltas, and demo image path, SHA-256, size,
+MIME type, dimensions, and idempotency key.
+
+Never store presigned URLs, redirect `Location`, credentials, DSNs or environment
+dumps, raw headers or bodies, image bytes, bucket/object keys, provider errors, or
+other secrets in evidence.
 
 ## Security boundary and limitations
 
-This service has no authentication, TLS, rate limiting, quota enforcement, or public
-upload controls. Do not expose it to a LAN or the Internet. The bucket must remain
-private, and credentials, DSNs, presigned URLs, request data, and object identifiers
-must not enter logs. This repository does not claim deployment, live AWS verification,
-broad S3 compatibility, or production readiness. Permanent tombstones bound physical
-orphan storage but are never garbage-collected from PostgreSQL.
+- The supported runtime is loopback-only on one trusted host. Do not bind it to a LAN,
+  public proxy, or the Internet.
+- There is no application authentication, TLS termination, rate limiting, quota,
+  storage-side 10 MiB enforcement, public media edge, or browser CORS contract.
+- The bucket must remain private and runtime credentials must be least-privilege.
+- Presigned URLs are replayable bearer capabilities until expiry; a successful direct
+  PUT is not publication evidence.
+- Cleanup is idempotent and at least once, not exactly once. Permanent tombstones are
+  not garbage-collected from PostgreSQL.
+- One process and one sequential finalizer are intentional local-demo limits; HA,
+  multipart uploads, CDN delivery, performance claims, and capacity claims are absent.
+- Garage `v2.3.0` is the tested local target. Live AWS and broad S3 compatibility are
+  not verified.
+- The project does not claim production readiness, arbitrary-failure recovery, zero
+  data loss, public deployment, or open-source licensing.

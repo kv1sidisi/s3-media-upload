@@ -16,7 +16,7 @@ import (
 	"testing/iotest"
 )
 
-func TestValidationPolicy(t *testing.T) {
+func TestValidationPolicyV1(t *testing.T) {
 	tests := []struct {
 		format      string
 		contentType string
