@@ -1,4 +1,4 @@
-package main
+package app
 
 import (
 	"bufio"
@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -200,7 +202,11 @@ func TestE2EHTTPHeaderBoundary(t *testing.T) {
 }
 
 func TestMigrationIsExternallyTransactional(t *testing.T) {
-	source, err := os.ReadFile("migrations/0001_initial.sql")
+	_, testFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("locate migration test source")
+	}
+	source, err := os.ReadFile(filepath.Join(filepath.Dir(testFile), "..", "..", "migrations", "0001_initial.sql"))
 	if err != nil {
 		t.Fatalf("read migration: %v", err)
 	}
@@ -246,7 +252,7 @@ func TestRunRejectsInvalidConfig(t *testing.T) {
 	t.Setenv("AWS_REGION", "garage")
 	t.Setenv("S3_ENDPOINT", "http://127.0.0.1:3900")
 	var logs bytes.Buffer
-	err := run(context.Background(), slog.New(slog.NewJSONHandler(&logs, nil)))
+	err := Run(context.Background(), slog.New(slog.NewJSONHandler(&logs, nil)))
 	if err == nil {
 		t.Fatal("service accepted invalid startup config")
 	}
@@ -320,7 +326,7 @@ func TestIntegrationServiceLifecycle(t *testing.T) {
 	var logs bytes.Buffer
 	result := make(chan error, 1)
 	go func() {
-		result <- run(ctx, slog.New(slog.NewJSONHandler(&logs, nil)))
+		result <- Run(ctx, slog.New(slog.NewJSONHandler(&logs, nil)))
 	}()
 	client := &http.Client{Timeout: 5 * time.Second}
 	deadline := time.Now().Add(10 * time.Second)

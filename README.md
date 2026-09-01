@@ -98,7 +98,7 @@ docker compose exec -T postgres \
 set -a
 . ./.env
 set +a
-GOTOOLCHAIN=local go run .
+GOTOOLCHAIN=local go run ./cmd/s3-media-upload
 ```
 
 The migration is intentionally external and applies schema ledger version `1`. If old
@@ -200,7 +200,7 @@ mkdir .ticket01-bin
 TEST_MEMORY_LIMIT=2560m docker compose run --rm -T \
   --volume "$PWD/.ticket01-bin:/out" \
   --env GOMEMLIMIT=2GiB \
-  test sh -ec 'GOTOOLCHAIN=local go test -c -o /out/service.test .'
+  test sh -ec 'GOTOOLCHAIN=local go test -c -o /out/service.test ./internal/app'
 TEST_MEMORY_LIMIT=256m docker compose run --rm -T \
   --volume "$PWD/.ticket01-bin:/out:ro" \
   --env GOMEMLIMIT=230MiB \
@@ -233,7 +233,7 @@ image digests listed above.
 
 | Evidence | Command or exact input | Result | Supported claim |
 | --- | --- | --- | --- |
-| Quick/full/race | The verification commands above, unchanged. Full used a 2560 MiB build with `GOMEMLIMIT=2GiB`, then a 256 MiB execution with `GOMEMLIMIT=230MiB`; race used 2560 MiB. | Quick: `ok` in `0.997s`. Full: `PASS`, seed `1788256824094762465`, 31 seconds including cold build. Race: `ok` in `18.203s`, 54 seconds including cold race build. Non-short PostgreSQL/Garage tests ran without skip, timeout, hang, or race report; the suite contains `TestParentFirstCandidateTerminalRace` and `TestE2EFinalizeRecovery/delegate_then_fail`. | The canonical local quick/full/race suite passed under the recorded version and memory boundaries. |
+| Quick/full/race | The then-current verification commands; before the package moved to `internal/app`, the full gate compiled `.`. Full used a 2560 MiB build with `GOMEMLIMIT=2GiB`, then a 256 MiB execution with `GOMEMLIMIT=230MiB`; race used 2560 MiB. | Quick: `ok` in `0.997s`. Full: `PASS`, seed `1788256824094762465`, 31 seconds including cold build. Race: `ok` in `18.203s`, 54 seconds including cold race build. Non-short PostgreSQL/Garage tests ran without skip, timeout, hang, or race report; the suite contains `TestParentFirstCandidateTerminalRace` and `TestE2EFinalizeRecovery/delegate_then_fail`. | The canonical local quick/full/race suite passed under the recorded version and memory boundaries. |
 | Live demo | A sanitized non-interactive execution of the documented endpoint sequence used status-only `curl` calls and in-memory `plutil` parsing with `/tmp/media-upload-ticket07.png`, SHA-256 `431ced6916a2a21a156e38701afe55bbd7f88969fbbfc56d7fe099d47f265460`, 68 bytes, `image/png`, `1x1`, and idempotency key `9e7763d1-3cd6-4ee5-a7f9-0701f6a09eaa`. Opaque capabilities were parsed only in shell memory and never printed or stored. | `/livez=200`, `/readyz=200`, create `201`, exact replay `200` with the same upload ID, direct PUT `200`, completion `202`, terminal `ready`, content `307`, download `200`, and `cmp=0` in one second. Status exposed decoder-derived `68,image/png,1x1` and no capability. Transition deltas were `1,1,1`; exact safe log counts were `service.started=1`, `service.stopping=1`, `service.stopped=1`, `capability.issued=4`, `upload.transition=3`, `finalize.phase=16`, and `http.request_finished=12`. The log regex audit found no `put_succeeded`, `X-Amz-`, `location`, `authorization`, `object_key`, `bucket`, `sha256`, `idempotency_key`, `claim_token`, or `reservation_token`. | One loopback Garage flow on the recorded revision reached verified `ready` and returned exact bytes; this is not an AWS, production, performance, or arbitrary-failure claim. |
 
 Never store presigned URLs, redirect `Location`, credentials, DSNs or environment

@@ -51,7 +51,7 @@ jobs:
           TEST_MEMORY_LIMIT=2560m docker compose run --rm -T \
             --volume "$PWD/.ticket01-bin:/out" \
             --env GOMEMLIMIT=2GiB \
-            test sh -ec 'GOTOOLCHAIN=local go test -c -o /out/service.test .'
+            test sh -ec 'GOTOOLCHAIN=local go test -c -o /out/service.test ./internal/app'
           TEST_MEMORY_LIMIT=256m docker compose run --rm -T \
             --volume "$PWD/.ticket01-bin:/out:ro" \
             --env GOMEMLIMIT=230MiB \

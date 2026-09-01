@@ -1,4 +1,4 @@
-package main
+package app
 
 import (
 	"bytes"
@@ -698,7 +698,7 @@ func TestE2EGracefulShutdown(t *testing.T) {
 	var logs bytes.Buffer
 	serviceResult := make(chan error, 1)
 	go func() {
-		serviceResult <- run(serviceContext, slog.New(slog.NewJSONHandler(&logs, nil)))
+		serviceResult <- Run(serviceContext, slog.New(slog.NewJSONHandler(&logs, nil)))
 	}()
 	select {
 	case <-deleteStarted:

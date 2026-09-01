@@ -1,4 +1,4 @@
-package main
+package app
 
 import (
 	"context"
@@ -8,10 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"os"
-	"os/signal"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -22,17 +19,8 @@ const (
 	maxHeaderBytes  = 12288
 )
 
-func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	if err := run(ctx, logger); err != nil {
-		logger.Error("service.start_failed", "component", "service")
-		os.Exit(1)
-	}
-}
-
-func run(ctx context.Context, logger *slog.Logger) error {
+// Run starts the service and blocks until shutdown or a fatal error.
+func Run(ctx context.Context, logger *slog.Logger) error {
 	cfg, err := loadConfig()
 	if err != nil {
 		return err
